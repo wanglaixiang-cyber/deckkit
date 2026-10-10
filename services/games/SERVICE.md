@@ -33,6 +33,7 @@ deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体�
 | 收尾 | 前后快照 diff → 在 prefix 里挑出主程序 → 写 `run.sh`（内置 prefix + Proton 版本）→ 写 `~/.local/share/applications/deckkit-<slug>.desktop`（名字/图标取自安装器）→ 记录 `store/<slug>/meta.tsv`。**找不到主程序就停手报错**（只落了运行库的更新器式安装器）<br>`find-game-exe` 的排除项只按 **prefix 内部**的路径匹配（例如 `drive_c/Program Files*/Steam/`）—— 不要写 `/Steam/`，那会匹配上 `~/.steam/steam/steamapps/…` 而把所有 exe 滤光（踩过） |
 | 拉起安装器 | `gctl run` **是阻塞调用**：它一直等到安装器进程退出（你点完 Finish / 关掉窗口）才返回 → 返回即收尾，**不需要任何"探测安装器状态"的循环**（曾经为此写了一整套判据，纯属多余）。中途 Ctrl-C 只置标志不退出，**照样走收尾**（安装往往已经完成） |
 | Steam 条目 | 收尾后**自动**写（`--no-shortcut` 跳过；也可单独跑 `deck games shortcut <名字>`）：写 `userdata/*/config/shortcuts.vdf`（二进制 KeyValues）。写之前做「解析→回写=原文」的**字节级自检** + 备份，并要求 Steam 未运行（命令自动处理会话） |
+| 封面 | 紧接着**自动**做（`--no-cover` 跳过，或事后 `deck games cover <名字>`）：从主程序 exe 抠图标 → 在 Mac 上渲染 → 往 Steam 的 grid 目录写全套 5 个文件。见下面《封面》一节 |
 
 ## 流程（免安装 / 绿色版）
 
@@ -46,6 +47,7 @@ deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体�
 | 主程序 | `gamectl find-game-exe --dir <游戏目录>`：排除 unins/setup/redist/… 后取最大的 exe；你点的就是 exe 的话直接用它 |
 | prefix | 照旧先建一个**空的**：第一次启动时 Proton 自己初始化（日志 `Upgrading prefix from None to 11.0-100`） |
 | 会话 | 只有"写 `shortcuts.vdf`"这一步需要 Steam 不在跑（和 `shortcut` 共用），拷贝、挑主程序都不需要 |
+| 封面 | 和安装包那条一样**自动**做（`--no-cover` 跳过）：抠 exe 图标 → 渲染 → 写 grid 全套 5 个 |
 
 `run.sh` 是**Linux 脚本**，Steam 当原生程序跑，脚本自己带好 `STEAM_COMPAT_DATA_PATH` 和 Proton ——
 所以那条快捷方式**不要**设"强制使用 Proton"，也完全不需要写 `config.vdf`。
@@ -116,6 +118,9 @@ deck games cover <名字> --reicon        # 丢掉缓存的图标，重新从 ex
   就是这样：595 个新文件里没有主程序）。`finish` 会报"没找到主程序"并停手 —— 这时别登记 Steam 条目。
 - **免安装是"整份拷贝"**：拷的是**主程序所在那一层**。数据在上一层（比如 exe 在 `bin/` 里、
   资源在 `bin/..`）时，要么选游戏根目录，要么选根目录那一层的 exe。
+- **卸载会把 Steam grid 里的封面也清掉**（`<appid>p.png` / `.png` / `_header.jpg` /
+  `_hero.png` / `_logo.png`，连用户自己的 `.deckkit-bak` 一起）—— 不然会留一堆 appid 已经不存在的
+  孤儿图；要留封面就先 `cp` 出来。
 - **卸载会连游戏目录一起删** —— 免安装游戏的存档常在游戏目录里（SRPG Studio 是 `Save/`），
   要留就先自己拷出来。装 exe 的游戏存档在 prefix 里，同理。
 - **别用日志行数判断"游戏起没起来"**：不设 `PROTON_LOG` 时 Proton 会把 `DXVK_LOG_LEVEL` 设成

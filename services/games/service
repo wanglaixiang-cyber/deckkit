@@ -712,8 +712,10 @@ cmd_uninstall() {
   local gd ng=0
   while IFS= read -r gd; do
     [ -n "$gd" ] || continue
-    rsh "rm -f \"$gd/${appid}p.png\" \"$gd/${appid}.png\" \"$gd/${appid}_header.jpg\" \"$gd/${appid}_hero.png\" \"$gd/${appid}_logo.png\" \"$gd/${appid}\"*.deckkit-bak \
-              \"$gd/._${appid}p.png\" \"$gd/._${appid}_header.jpg\"" 2>/dev/null && ng=$((ng + 1))
+    # 全套 5 个 + 可能的自备份 + 老版本留下的 AppleDouble（`._<appid>*` 一律清）
+    rsh "rm -f \"$gd/${appid}p.png\" \"$gd/${appid}.png\" \"$gd/${appid}_header.jpg\" \
+              \"$gd/${appid}_hero.png\" \"$gd/${appid}_logo.png\" \
+              \"$gd/${appid}\"*.deckkit-bak \"$gd/._${appid}\"*" 2>/dev/null && ng=$((ng + 1))
   done < <(grid_dirs)
   [ "$ng" -gt 0 ] && dim "  Steam grid 里的封面也清掉了"
   ok "已卸载 ${slug}（游戏本体 + 启动脚本 + 桌面菜单项 + 记录）"

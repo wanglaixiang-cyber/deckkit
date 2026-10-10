@@ -887,19 +887,33 @@ cmd_clean() {
 #   ③ 方向键同时认 `ESC[A` 与 `ESC OA`（DECCKM）。
 #   ④ 画面必须**装得下**：列表超长就开窗口分页（多余项用 ↑/↓ 提示），否则会滚屏。
 #   ⑤ 跑外部命令（卸载/封面/维修）时先退出备用屏，命令输出留在正常屏幕里可回看。
+# 还原用的状态必须是**全局**的：EXIT trap 触发时 cmd_tui 的 local 已经出了作用域，
+# 用 local 会 `set -u` 报 "echo_off: unbound variable" 并且**不会执行 stty echo** ——
+# 用户终端就被留在"无回显"状态（实测踩到，只能 reset 恢复）。
+TUI_ECHO_OFF=0
+TUI_RESTORE_SEQ=''
+tui_restore_global() {
+  printf '%s\033[0m' "${TUI_RESTORE_SEQ:-$'\033[?25h\033[?1049l'}"
+  if [ "${TUI_ECHO_OFF:-0}" = 1 ]; then
+    { stty echo </dev/tty 2>/dev/null || stty echo 2>/dev/null; } || true
+    TUI_ECHO_OFF=0
+  fi
+  return 0
+}
+
 cmd_tui() {
   if [ ! -t 0 ] || [ ! -t 1 ]; then cmd_list; return 0; fi
   local ROOT; ROOT="$(cd "$SVC_DIR/../.." && pwd)"     # 框架根：$SVC_DIR 是 <root>/services/games
-  local slugs=() names=() sizes=() sel=0 key rest ans brief="" echo_off=0
+  local slugs=() names=() sizes=() sel=0 key rest ans brief=
   local ALT_ON ALT_OFF CIVIS CNORM
   ALT_ON="$(tput smcup 2>/dev/null)";  [ -n "$ALT_ON" ]  || ALT_ON=$'\033[?1049h'
   ALT_OFF="$(tput rmcup 2>/dev/null)"; [ -n "$ALT_OFF" ] || ALT_OFF=$'\033[?1049l'
   CIVIS="$(tput civis 2>/dev/null)";   [ -n "$CIVIS" ]   || CIVIS=$'\033[?25l'
   CNORM="$(tput cnorm 2>/dev/null)";   [ -n "$CNORM" ]   || CNORM=$'\033[?25h'
 
-  tui_echo_on()  { [ "$echo_off" = 1 ] && { stty echo 2>/dev/null; echo_off=0; }; }
-  tui_echo_off() { [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }; }
-  tui_enter() { printf '%s%s' "$ALT_ON" "$CIVIS"; tui_echo_off; }
+  tui_echo_on()  { [ "${TUI_ECHO_OFF:-0}" = 1 ] && { { stty echo </dev/tty 2>/dev/null || stty echo 2>/dev/null; } || true; TUI_ECHO_OFF=0; }; }
+  tui_echo_off() { [ -t 0 ] && { stty -echo 2>/dev/null; TUI_ECHO_OFF=1; }; }
+  tui_enter() { TUI_RESTORE_SEQ="$CNORM$ALT_OFF"; printf '%s%s' "$ALT_ON" "$CIVIS"; tui_echo_off; }
   tui_leave() { tui_echo_on; printf '%s%s\033[0m' "$CNORM" "$ALT_OFF"; }
   tui_restore() { tui_leave; }
 
@@ -1009,19 +1023,29 @@ cmd_tui() {
     printf '\033[%d;1H\033[K  %s' "$LINES" "$(tui_cut "$(( COLS - 4 ))" "$1")"
   }
 
-  suspend_run() {   # 退出备用屏跑一条命令（输出留在正常屏幕里），回车后回来
+  # 等"任意键"：**echo 关着**（否则方向键会被原样回显成 ^[[A），并且带超时 ——
+  # 用行读取等回车 + echo 打开，就是之前"卡在这儿、方向键变成 ^[[A"的原因。
+  wait_key() {
+    printf '\n  %s%s%s' "$C_DIM" "${1:-按任意键继续}" "$C_RST"
+    [ -t 0 ] && { stty -echo 2>/dev/null; TUI_ECHO_OFF=1; }
+    IFS= read -rsn1 -t 60 ans || true
+  }
+
+  suspend_run() {   # 退出备用屏跑一条命令（输出留在正常屏幕里），按任意键回来
     local slug="$1"; shift
     tui_leave
     printf '\n'
     "$@" || warn "这条命令失败了"
-    printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
-    IFS= read -r ans
+    wait_key "按任意键回到列表"
     tui_enter
     printf '\033[H\033[2J'
     load_list
   }
 
-  trap 'tui_restore; exit 0' INT TERM
+  # EXIT 也挂上（用全局版还原）：万一中途被 set -u / 信号打断，也不会把终端留在
+  # "无回显 + 备用屏"里。INT/TERM 还要退出，否则 Ctrl-C 后循环会继续跑。
+  trap 'tui_restore_global' EXIT
+  trap 'tui_restore_global; exit 0' INT TERM
   tui_enter
   printf '\033[H\033[2J  %sdeckkit · 游戏管理%s\n\n  %s正在读取服务状态和游戏列表…%s\n' "$C_B" "$C_RST" "$C_DIM" "$C_RST"
   load_list
@@ -1040,10 +1064,11 @@ cmd_tui() {
         sel=$(( sel < ${#slugs[@]} - 1 ? sel + 1 : 0 )) ;;
       ''|$'\n'|$'\r')
         [ "${#slugs[@]}" = 0 ] && continue
-        tui_echo_on
+        [ -t 0 ] && { stty -echo 2>/dev/null; TUI_ECHO_OFF=1; }
         prompt_line "卸载「${names[$sel]}」（本体 + Steam 条目 + 封面，不可恢复；会退出 Steam）？[y/N] "
-        IFS= read -r ans
-        tui_echo_off
+        IFS= read -rsn1 -t 30 ans || ans=""
+        # 关着 echo 用户看不到自己按的键，这里把结果显示在同一行
+        prompt_line "卸载「${names[$sel]}」？[y/N] ${ans:-（超时，按未确认处理）}"
         if [ "$ans" = y ] || [ "$ans" = Y ]; then
           suspend_run "${slugs[$sel]}" cmd_uninstall --yes --with-shortcut "${slugs[$sel]}"
         fi

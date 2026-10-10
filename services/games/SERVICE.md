@@ -74,10 +74,15 @@ MyGame ver1.01（SRPG Studio，878M 免安装目录）：
 
 Steam 给「非 Steam 快捷方式」的封面就是往它自己的 grid 目录里丢文件 —— 不用碰 Steam 的任何配置：
 
+一次写全套 5 个（Deck 主页那条**横版卡**用的是 `_hero.png` + `_logo.png`，只写前两个时那条是空的 —— 实测踩过）：
+
 | 文件 | 用途 | 尺寸 |
 |---|---|---|
 | `userdata/<id>/config/grid/<appid>p.png` | 库里的大封面（Gaming Mode 的网格就是它） | 600×900 |
-| `userdata/<id>/config/grid/<appid>_header.jpg` | 列表 / 最近游戏的头图 | 460×215 |
+| `userdata/<id>/config/grid/<appid>.png` | 横版「网格图」 | 920×430 |
+| `userdata/<id>/config/grid/<appid>_header.jpg` | 列表头图 | 460×215 |
+| `userdata/<id>/config/grid/<appid>_hero.png` | **主页「最近游戏」横版卡的底图**（不写字，留空给 Steam 压字标） | 1920×620 |
+| `userdata/<id>/config/grid/<appid>_logo.png` | 压在 hero 上的**透明字标**（游戏名） | 1280×720 |
 
 ```bash
 deck games cover <名字|all>             # 默认：主程序自带图标居中 + 背景按图标主色上色 + 标题

@@ -712,7 +712,7 @@ cmd_uninstall() {
   local gd ng=0
   while IFS= read -r gd; do
     [ -n "$gd" ] || continue
-    rsh "rm -f \"$gd/${appid}p.png\" \"$gd/${appid}_header.jpg\" \"$gd/${appid}\"*.deckkit-bak \
+    rsh "rm -f \"$gd/${appid}p.png\" \"$gd/${appid}.png\" \"$gd/${appid}_header.jpg\" \"$gd/${appid}_hero.png\" \"$gd/${appid}_logo.png\" \"$gd/${appid}\"*.deckkit-bak \
               \"$gd/._${appid}p.png\" \"$gd/._${appid}_header.jpg\"" 2>/dev/null && ng=$((ng + 1))
   done < <(grid_dirs)
   [ "$ng" -gt 0 ] && dim "  Steam grid 里的封面也清掉了"
@@ -921,6 +921,9 @@ cmd_cover() {
     if ! swift "$SVC_DIR/mac/cover.swift" --name "$name" \
          --out "$COVER_TMP/$appid/${appid}p.png" \
          --header "$COVER_TMP/$appid/${appid}_header.jpg" \
+         --grid "$COVER_TMP/$appid/${appid}.png" \
+         --hero "$COVER_TMP/$appid/${appid}_hero.png" \
+         --logo "$COVER_TMP/$appid/${appid}_logo.png" \
          ${img:+--image "$img"} ${icon_local:+--icon "$icon_local"} \
          $extra ${subtitle:+--subtitle "$subtitle"} >/dev/null; then
       warn "渲染失败，跳过：$name"; skip_n=$((skip_n + 1)); continue
@@ -933,17 +936,20 @@ cmd_cover() {
       # 判据是 store 里的标记文件 —— 光看"文件在不在"会把我们上一轮生成的封面
       # 也备份一遍（实测 7 个游戏留下 14 个 .deckkit-bak 垃圾）。
       if ! rsh "test -f \"\${HOME}/deckkit/services/games/store/$slug/cover.own\"" 2>/dev/null; then
-        rsh "for f in \"$gd/${appid}p.png\" \"$gd/${appid}_header.jpg\"; do
+        rsh "for f in \"$gd/${appid}p.png\" \"$gd/${appid}.png\" \"$gd/${appid}_header.jpg\" \"$gd/${appid}_hero.png\" \"$gd/${appid}_logo.png\"; do
                [ -f \"\$f\" ] && [ ! -f \"\$f.deckkit-bak\" ] && cp -p \"\$f\" \"\$f.deckkit-bak\"
              done" >/dev/null 2>&1 || true
       fi
       # COPYFILE_DISABLE=1 + --no-xattrs：不加的话 bsdtar 会给每个文件附一份
       # AppleDouble（`._<appid>p.png`，163 字节）一起塞进 grid —— 实测 6 个游戏
       # 留下 16 个 `._*` 垃圾文件，而 `ls`（不带 -a）根本看不出来。
+      # 写全套：竖版 p.png、横版 .png / _header.jpg / _hero.png / _logo.png
+      # （Deck 主页「最近游戏」那条横版卡用的是 hero + logo，之前只写了前两个所以那条是空的）
       if COPYFILE_DISABLE=1 tar --no-xattrs -C "$COVER_TMP/$appid" -cf - \
-           "${appid}p.png" "${appid}_header.jpg" \
+           "${appid}p.png" "${appid}.png" "${appid}_header.jpg" \
+           "${appid}_hero.png" "${appid}_logo.png" \
            | rsh "tar -xf - -C \"$gd\"" 2>/dev/null \
-         && rsh "test -s \"$gd/${appid}p.png\" && test -s \"$gd/${appid}_header.jpg\"" 2>/dev/null; then
+         && rsh "for f in \"$gd/${appid}p.png\" \"$gd/${appid}.png\" \"$gd/${appid}_header.jpg\" \"$gd/${appid}_hero.png\" \"$gd/${appid}_logo.png\"; do test -s \"\$f\" || exit 1; done" 2>/dev/null; then
         n=$((n + 1))
         # 打上「这份封面是 deckkit 写的」标记，下次重新生成就不用备份自己了
         rsh "printf '%s\n' '$appid' > \"\${HOME}/deckkit/services/games/store/$slug/cover.own\"" 2>/dev/null || true
@@ -952,7 +958,7 @@ cmd_cover() {
       fi
     done < <(grid_dirs)
     if [ "$n" -gt 0 ]; then
-      ok "${name} → ${n} 个 grid 目录（${appid}p.png + _header.jpg）"
+      ok "${name} → ${n} 个 grid 目录（p/header/hero/logo + .png 全套）"
       ok_n=$((ok_n + 1))
     else
       warn "${name}：一个 grid 目录都没写到（Steam 还没建过 userdata？）"

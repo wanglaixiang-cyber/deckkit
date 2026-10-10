@@ -8,6 +8,9 @@
 //
 //  用法：
 //    swift cover.swift --name "<游戏名>" --out <竖版.png> [--header <横版.jpg>]
+//                      [--grid <横版方图.png>]            # 920×430，<appid>.png 那张（横版"网格图"）
+//                      [--hero <横版英雄图.png>]           # 1920×620，库里/主页那张横版卡
+//                      [--logo <透明字标.png>]             # 1280×720 透明底，Steam 把它压在英雄图上
 //                      [--icon <exe 里抠出来的图标.png>]   # 渐变按图标主色上色 + 居中放这枚图标
 //                      [--icon-fill]                      # 改成把图标铺满整张
 //                      [--image <底图>]                    # 用别的图铺满
@@ -40,6 +43,9 @@ guard let name = args["name"], let outPath = args["out"] else {
     exit(2)
 }
 let headerPath = args["header"]
+let gridPath = args["grid"]
+let heroPath = args["hero"]
+let logoPath = args["logo"]
 let iconPath = args["icon"]
 let imagePath = args["image"]
 let iconFill = flags.contains("icon-fill")
@@ -241,7 +247,8 @@ func drawTitle(_ text: String, box: CGRect, size: CGFloat, align: NSTextAlignmen
 // ── 渲染一张 ──
 func render(size: NSSize, title: String, sub: String, look: Look, titleBox: CGRect,
             titleAlign: NSTextAlignment, mark: CGRect, iconCenter: CGPoint, iconMax: CGFloat,
-            maxLines: Int, out: String, jpeg: Bool) {
+            maxLines: Int, out: String, jpeg: Bool,
+            drawTitleText: Bool = true, transparent: Bool = false) {
     // 显式像素尺寸的位图上下文：Retina 上 lockFocus 会渲染成 2 倍大（实测）
     guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
                                      pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
@@ -255,18 +262,21 @@ func render(size: NSSize, title: String, sub: String, look: Look, titleBox: CGRe
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
 
-    if let f = look.fill, !f.isEmpty {
-        drawFill(ctx, path: f, size: size, overall: 0.28, scrim: 0.9)
-    } else {
-        drawGradient(ctx, size: size, tintFrom: look.tintFrom)
+    if !transparent {
+        if let f = look.fill, !f.isEmpty {
+            drawFill(ctx, path: f, size: size, overall: 0.28, scrim: 0.9)
+        } else {
+            drawGradient(ctx, size: size, tintFrom: look.tintFrom)
+        }
     }
+    if transparent { ctx.clear(CGRect(origin: .zero, size: size)) }
     if let ic = look.icon, !ic.isEmpty {
         drawIcon(ctx, path: ic, center: iconCenter, maxSide: iconMax)
     }
     let fs = fitFontSize(title, font: { NSFont.boldSystemFont(ofSize: $0) },
                          box: titleBox.size, maxLines: maxLines,
-                         oneLineMin: size.width > 500 ? 34 : 22)
-    drawTitle(title, box: titleBox, size: fs, align: titleAlign)
+                         oneLineMin: titleBox.width > 400 ? 34 : 22)
+    if drawTitleText { drawTitle(title, box: titleBox, size: fs, align: titleAlign) }
     if !sub.isEmpty {
         let para = NSMutableParagraphStyle()
         para.alignment = titleAlign
@@ -279,7 +289,9 @@ func render(size: NSSize, title: String, sub: String, look: Look, titleBox: CGRe
             .draw(with: CGRect(x: titleBox.minX, y: 30, width: titleBox.width, height: 60),
                   options: [.usesLineFragmentOrigin])
     }
-    drawMark(ctx, x: mark.minX, y: mark.minY, height: mark.height, alpha: 0.5)
+    if mark.height > 0 {
+        drawMark(ctx, x: mark.minX, y: mark.minY, height: mark.height, alpha: 0.5)
+    }
     NSGraphicsContext.restoreGraphicsState()
 
     let data = jpeg ? rep.representation(using: .jpeg, properties: [.compressionFactor: 0.92])
@@ -312,4 +324,34 @@ if let hp = headerPath, !hp.isEmpty {
            iconCenter: CGPoint(x: 372, y: 110), iconMax: 130,
            maxLines: 3, out: hp, jpeg: true)
 }
+// ── 横版方图 920×430（就是 grid/<appid>.png 那张，标题在左、图标在右）──
+if let gp = gridPath, !gp.isEmpty {
+    render(size: NSSize(width: 920, height: 430), title: name, sub: "", look: look,
+           titleBox: hasIcon ? CGRect(x: 48, y: 110, width: 520, height: 230)
+                             : CGRect(x: 48, y: 150, width: 660, height: 200),
+           titleAlign: .left,
+           mark: CGRect(x: 820, y: 26, width: 44, height: 44 * MARK_H / MARK_W),
+           iconCenter: CGPoint(x: 740, y: 215), iconMax: 250,
+           maxLines: 3, out: gp, jpeg: false)
+}
+
+// ── 横版英雄图 1920×620（Steam Deck 主页「最近游戏」那张横版卡用的就是它）──
+// 这里**不写字**：Steam 会把 `_logo.png`（或游戏名）压在它上面，写了就重影。
+if let hp = heroPath, !hp.isEmpty {
+    render(size: NSSize(width: 1920, height: 620), title: name, sub: "", look: look,
+           titleBox: CGRect(x: 96, y: 120, width: 1000, height: 300), titleAlign: .left,
+           mark: CGRect(x: 1820, y: 40, width: 46, height: 46 * MARK_H / MARK_W),
+           iconCenter: CGPoint(x: 960, y: 310), iconMax: 400,
+           maxLines: 2, out: hp, jpeg: false, drawTitleText: false)
+}
+
+// ── 透明字标 1280×720：Steam 把它压在英雄图上（不写字标时它自己用游戏名）──
+if let lp = logoPath, !lp.isEmpty {
+    render(size: NSSize(width: 1280, height: 720), title: name, sub: "", look: Look(),
+           titleBox: CGRect(x: 72, y: 380, width: 1136, height: 300), titleAlign: .left,
+           mark: CGRect(x: 0, y: 0, width: 0, height: 0),
+           iconCenter: CGPoint(x: 0, y: 0), iconMax: 0,
+           maxLines: 3, out: lp, jpeg: false, transparent: true)
+}
+
 print(outPath)

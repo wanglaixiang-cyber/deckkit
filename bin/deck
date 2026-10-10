@@ -10,6 +10,7 @@
 #    deck root <命令>        以 root 在 Deck 上执行（需要免密 sudo 已授权）
 #    deck push <本地> <远端>  传文件到 Deck
 #    deck menu [--run|--install|--dev]  编译菜单栏 App（--install 装到 /Applications）
+#    deck brief             精简状态：一个服务一行（完整：deck status）
 #    deck vitals [--json]    读 Deck 电量 / 充电状态 / 温度 / 运行时长
 #    deck self-install       把 deck 放进 PATH（之后任意目录直接敲 deck）
 #    deck ensure [服务]      让服务自愈（幂等）：files 没挂上就挂上
@@ -129,6 +130,22 @@ cmd_list() {
   done
   echo
   printf '%s  根目录：%s%s\n' "$D" "$ROOT" "$N"
+}
+
+# 精简状态：一行一个服务（终端里的游戏管理页顶部用的就是它，也是"不想看全量"时的一条命令）。
+# 想好看全量：deck status
+cmd_brief() {
+  local s e out
+  for s in $(services); do
+    e="$(svc_entry "$s")"
+    if [ -x "$e" ]; then
+      out="$("$e" status 2>/dev/null | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
+      printf '  %s%-10s%s %s\n' "$B" "$s" "$N" "${out:-—}"
+    else
+      printf '  %s%-10s%s %s(没有 service 入口)%s\n' "$B" "$s" "$N" "$D" "$N"
+    fi
+  done
+  printf '  %s完整状态：deck status · 服务清单：deck list%s\n' "$D" "$N"
 }
 
 cmd_overview() {
@@ -387,6 +404,7 @@ REMOTE
 case "${1:-}" in
   ""|overview)        cmd_overview ;;
   list|ls)            cmd_list ;;
+  brief|now)          cmd_brief ;;          # 精简：一个服务一行
   status)             shift; cmd_status "$@" ;;
   ssh)                shift; cmd_ssh "$@" ;;
   root)               shift; cmd_root "$@" ;;

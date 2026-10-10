@@ -7,7 +7,7 @@
 //  菜单内容：
 //    · Steam Deck 状态（在线/离线 + 主机名 + 上次刷新时间）
 //    · 各服务的一行状态（来自 services/<名字>/service status 的第一行）
-//    · 刷新 / 在终端看完整状态 / 打开 deckkit 目录 / 退出
+//    · 刷新 / 游戏管理（终端交互列表）/ 完整状态 / 打开 deckkit 目录 / 退出
 //
 //  约定（docs/约定.md §5）：绝不在主线程做同步网络调用 —— 所有探测都在
 //  后台队列上跑，并带超时；结果回到主线程再重建菜单。
@@ -554,7 +554,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         r.target = self
         menu.addItem(r)
 
-        let t = NSMenuItem(title: "在终端里查看完整状态", action: #selector(openTerminal), keyEquivalent: "")
+        // 终端里分两条：日常只要"游戏管理"（精简状态 + 方向键列表），要看全量再点下面那条
+        let g = NSMenuItem(title: "游戏管理（终端 · 方向键操作）", action: #selector(openGamesTUI), keyEquivalent: "")
+        g.target = self
+        menu.addItem(g)
+
+        let t = NSMenuItem(title: "完整状态（终端）", action: #selector(openTerminal), keyEquivalent: "")
         t.target = self
         menu.addItem(t)
 
@@ -698,6 +703,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    /// 游戏管理：精简服务状态 + 方向键操作的游戏列表（`deck games` 在终端里就是这个）
+    @objc private func openGamesTUI() {
+        lastUserAction = Date()
+        openInTerminal("{ ./bin/deck games; }")
+    }
+
+    /// 完整状态：原来的全量 dump（`deck status` + 命令清单）
     @objc private func openTerminal() {
         lastUserAction = Date()      // 这条命令也要跑一会儿，期间同样别去自愈
         openInTerminal("{ ./bin/deck status; echo; ./bin/deck help; }")

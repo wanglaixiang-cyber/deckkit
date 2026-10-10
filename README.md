@@ -40,6 +40,7 @@ deck                       # 已装到 PATH（deck self-install 装的）；也�
 ln -sf "$(pwd)/bin/deck" ~/.local/bin/deck   # 在仓库根目录执行（或直接跑 deck self-install）
 
 deck                       # 概览
+deck brief                 # 精简状态（一个服务一行；完整：deck status）
 deck list                  # 服务清单
 deck status                # 所有服务的状态
 deck files mount           # 把 Deck 家目录挂到访达
@@ -91,6 +92,8 @@ deck menu --dev         # 只想编仓库里那份（menubar/DeckKit.app），�
 
 - **图标**：Steam Deck 官方 logo 的机身标记（template image，自动适配浅色/深色菜单栏）；
   Deck 离线时整个图标压暗。
+- **终端入口分两条**：「游戏管理（终端 · 方向键操作）」= 精简服务状态 + 游戏列表（↑↓ 选、
+  回车卸载、c 封面、f 维修、q 退出）；「完整状态（终端）」= 原来的全量 dump。日常用前者。
 - **第一栏**：Deck 在线状态、主机名与刷新时间，再加一行遥测 ——
   电量、充电状态、APU 温度、已开机时长。在用电池时这一行标黄
   （对一台常驻服务器来说靠电池跑是要留意的）；完整读数（含电池温度、负载）

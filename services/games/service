@@ -877,6 +877,114 @@ cmd_clean() {
   ok "清掉 ${n} 条残留记录"
 }
 
+# ─────────────────────── 交互式游戏管理（TUI）───────────────────────
+# 菜单栏那条「游戏管理」走的就是它：**方向键选、回车卸载**，不用记命令。
+# 顶上只放一份精简服务状态（deck brief），要完整状态自己跑 `deck status`。
+# stdin/stdout 不是终端（管道、脚本）时自动退回普通列表。
+cmd_tui() {
+  if [ ! -t 0 ] || [ ! -t 1 ]; then cmd_list; return 0; fi
+  local ROOT; ROOT="$(cd "$SVC_DIR/../.." && pwd)"     # 框架根：$SVC_DIR 是 <root>/services/games
+  local slugs=() names=() sizes=() sel=0 key rest ans i
+
+  load_list() {
+    slugs=(); names=(); sizes=()
+    local line slug name size
+    while IFS=$'\t' read -r slug name size; do
+      [ -n "$slug" ] || continue
+      slugs+=("$slug"); names+=("$name"); sizes+=("$size")
+    done < <(rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do
+                    [ -f "$d/meta.tsv" ] || continue
+                    n=$(sed -n "s/^name=//p" "$d/meta.tsv" | head -1)
+                    s=$(sed -n "s/^size=//p" "$d/meta.tsv" | head -1)
+                    [ -n "$s" ] || s=$(sed -n "s/^prefix_size=//p" "$d/meta.tsv" | head -1)
+                    printf "%s\t%s\t%s\n" "$(basename "$d")" "$n" "$s"
+                  done' 2>/dev/null)
+    [ "$sel" -ge "${#slugs[@]}" ] && sel=$(( ${#slugs[@]} > 0 ? ${#slugs[@]} - 1 : 0 ))
+  }
+
+  draw() {
+    printf '\033[H\033[2J'
+    printf '%s%s  deckkit · 游戏管理%s\n' "$C_B" "$C_B" "$C_RST"
+    printf '%s\n' "───────────────────────────────────────────────"
+    # 精简服务状态：一行一个服务（完整状态：deck status）
+    "$ROOT/bin/deck" brief 2>/dev/null | sed 's/^/  /'
+    printf '%s\n' "───────────────────────────────────────────────"
+    if [ "${#slugs[@]}" = 0 ]; then
+      printf '  （还没有装过游戏）\n'
+    else
+      local idx=0 name size
+      while [ "$idx" -lt "${#slugs[@]}" ]; do
+        name="${names[$idx]}"; size="${sizes[$idx]}"
+        [ ${#name} -gt 30 ] && name="$(printf '%s' "$name" | cut -c1-29)…"
+        if [ "$idx" = "$sel" ]; then
+          printf '\033[7m  ▶ %-32s %8s \033[0m\n' "$name" "$size"
+        else
+          printf '    %-32s %8s\n' "$name" "$size"
+        fi
+        idx=$((idx + 1))
+      done
+    fi
+    printf '%s\n' "───────────────────────────────────────────────"
+    printf '%s\n' "  ↑/↓ 选择 · 回车 卸载 · c 重做封面 · f 维修 · r 刷新 · q 退出"
+    printf '%s\n' "  完整状态：deck status   只列游戏：deck games ls"
+  }
+
+  do_action() {   # 把界面让开，跑一条命令，再回来
+    local slug="$1"; shift
+    printf '\033[?25h'
+    printf '\n'
+    "$@" || warn "这条命令失败了"
+    printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
+    IFS= read -r ans
+    printf '\033[?25l'
+    load_list
+  }
+
+  trap 'printf "\033[?25h\033[0m\n"; exit 0' INT TERM
+  printf '\033[?25l'
+  load_list
+  while :; do
+    draw
+    IFS= read -rsn1 key || break
+    if [ "$key" = $'\033' ]; then
+      IFS= read -rsn2 -t 1 rest || rest=""
+      key="$key$rest"
+    fi
+    case "$key" in
+      $'\033[A'|k)
+        sel=$(( sel > 0 ? sel - 1 : ${#slugs[@]} - 1 )) ;;
+      $'\033[B'|j)
+        sel=$(( sel < ${#slugs[@]} - 1 ? sel + 1 : 0 )) ;;
+      ''|$'\n'|$'\r')
+        [ "${#slugs[@]}" = 0 ] && continue
+        printf '\033[?25h'
+        printf '\n  卸载 %s%s%s（游戏本体 + Steam 条目 + 封面，不可恢复）\n' "$C_B" "${names[$sel]}" "$C_RST"
+        printf '  注：会顺带退出 Steam（要写 shortcuts.vdf），需要的话还会切到桌面模式。\n'
+        printf '  确认卸载？[y/N] '
+        IFS= read -r ans
+        if [ "$ans" = y ] || [ "$ans" = Y ]; then
+          cmd_uninstall "${slugs[$sel]}" --yes --with-shortcut
+          printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
+          IFS= read -r ans
+          load_list
+        else
+          printf '  已取消'
+        fi
+        printf '\033[?25l' ;;
+      c)
+        [ "${#slugs[@]}" = 0 ] && continue
+        do_action "${slugs[$sel]}" cmd_cover "${slugs[$sel]}" ;;
+      f)
+        [ "${#slugs[@]}" = 0 ] && continue
+        do_action "${slugs[$sel]}" cmd_fix "${slugs[$sel]}" ;;
+      r) load_list ;;
+      q|Q) break ;;
+    esac
+  done
+  printf '\033[?25h\033[0m'
+  return 0
+}
+
 # ─────────────────────────── 维修（fix）───────────────────────────
 # 两个实测踩过的坑，这里一次性收拾：
 #   ① 主程序被挑错：`find-game-exe` 只看大小 + 排除表，早先没排 `*CrashHandler*`，
@@ -1129,7 +1237,8 @@ cmd_cover() {
 
 cmd_help() {
   cat <<'EOF'
-    deck games              已装的游戏
+    deck games              游戏管理（终端里是方向键列表：↑↓ 选、回车卸载、q 退出）
+    deck games ls           只列已装的游戏（脚本里用这个）
     deck games add <exe>    装（自动切桌面模式、杀 Steam、装完收尾）
     deck games add <主程序.exe>  免安装游戏（按主程序定位目录 → 拷到 Deck → 登记 Steam）
     deck games rm <名字>     卸载（Steam 列表条目 + 游戏本体一起清）
@@ -1153,14 +1262,17 @@ cmd_shortcut_restore() {
 cmd_caps() { printf 'pick 选择安装包（setup.exe）或免安装游戏的主程序（game.exe）\tinstall\texe\n'; }
 usage() { sed -n '2,20p' "$0" | sed 's/^# \?//'; }
 
-case "${1:-status}" in
+case "${1:-}" in
   status|st)      shift; cmd_status ;;
   list|ls)        shift; cmd_list ;;
   install)        shift; cmd_install "$@" ;;
   shortcut)       shift; cmd_shortcut "$@" ;;
   desktop)        shift; cmd_desktop "$@" ;;
   finish)         shift; cmd_finish "$@" ;;
-  ""|ls|list)      cmd_list ;;
+  ls|list)        shift; cmd_list ;;
+  tui|ui)         cmd_tui ;;
+  # 裸 `deck games`：终端里进交互列表；非终端（管道/脚本）退回原来的概览
+  "")             if [ -t 0 ] && [ -t 1 ]; then cmd_tui; else cmd_status; fi ;;
   add)            shift; cmd_install "$@" ;;      # 简写：deck games add <exe>
   cover)          shift; cmd_cover "$@" ;;        # 生成立绘/封面写进 Steam 的 grid 目录
   fix)            shift; cmd_fix "$@" ;;          # 维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK
@@ -1175,6 +1287,6 @@ case "${1:-status}" in
   protons)        cmd_protons ;;
   install-here)   cmd_install_here ;;
   caps)           cmd_caps ;;
-  -h|--help|help|"") usage ;;
+  -h|--help|help) usage ;;
   *) die "games 不认识的子命令：$1" ;;
 esac

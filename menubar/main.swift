@@ -13,6 +13,7 @@
 //  后台队列上跑，并带超时；结果回到主线程再重建菜单。
 // ============================================================
 import Cocoa
+import UniformTypeIdentifiers        // 选择器的文件类型过滤用 UTType（macOS 11+）
 
 // ─────────────────────────── 路径与配置 ───────────────────────────
 // 框架根目录按三步找：
@@ -667,7 +668,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = true       // 纯文件夹（补丁、免安装游戏）也能选
         panel.canChooseFiles = true
-        if !svc.pickTypes.isEmpty { panel.allowedFileTypes = svc.pickTypes }
+        // 过滤用 UTType（`allowedFileTypes` 从 macOS 12 起弃用）。两条规矩：
+        //   ① 解析不出来的扩展名直接丢；**一个都解析不出来就不设过滤**，
+        //      否则面板会变成"什么都不让选"；
+        //   ② 设了 allowedContentTypes 之后必须把 `.folder` 也列上 ——
+        //      不列的话"选文件夹"会被系统灰掉，而 patches 的补丁文件夹、
+        //      games 的免安装游戏目录都要靠选文件夹。
+        if !svc.pickTypes.isEmpty {
+            var types = svc.pickTypes.compactMap { UTType(filenameExtension: $0) }
+            if !types.isEmpty {
+                types.append(.folder)
+                panel.allowedContentTypes = types
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
 

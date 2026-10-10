@@ -9,7 +9,7 @@
 #    deck ssh [命令]         SSH 到 Deck（默认 steamdeck.local）
 #    deck root <命令>        以 root 在 Deck 上执行（需要免密 sudo 已授权）
 #    deck push <本地> <远端>  传文件到 Deck
-#    deck menu [--run]       编译（并启动）菜单栏 App
+#    deck menu [--run|--install|--dev]  编译菜单栏 App（--install 装到 /Applications）
 #    deck vitals [--json]    读 Deck 电量 / 充电状态 / 温度 / 运行时长
 #    deck self-install       把 deck 放进 PATH（之后任意目录直接敲 deck）
 #    deck ensure [服务]      让服务自愈（幂等）：files 没挂上就挂上
@@ -187,6 +187,8 @@ cmd_doctor() {
   chk "swiftc 可用"      "command -v swiftc" "xcode-select --install（编译菜单栏 App 用）" soft
   chk "菜单栏 App 已编译" "[ -d '$ROOT/menubar/DeckKit.app' ]" "deck menu" soft
   chk "菜单栏能正常出菜单" "[ -x '$ROOT/menubar/DeckKit.app/Contents/MacOS/DeckKit' ] && '$ROOT/menubar/DeckKit.app/Contents/MacOS/DeckKit' --dump | grep -q 'Steam Deck'" "deck menu 重新编译" soft
+  # 装到 /Applications 的那份才是常驻的那个（它靠 Info.plist 的 DeckkitRoot 找回仓库）
+  chk "菜单栏 App 已装到 /Applications" "[ -d '/Applications/DeckKit.app' ] && /Applications/DeckKit.app/Contents/MacOS/DeckKit --dump 2>/dev/null | grep -q 'Steam Deck'" "deck menu --install（没装也行，用仓库里那份）" soft
 
   # 全角字符紧跟 $VAR：macOS 自带 bash 3.2 会把全角标点的字节吃进变量名，
   # 运行时报 "unbound variable" —— 而且只在带中文字符串的那一行炸。

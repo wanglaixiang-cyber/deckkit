@@ -15,8 +15,21 @@
 import Cocoa
 
 // ─────────────────────────── 路径与配置 ───────────────────────────
-// Bundle 位于 <deckkit>/menubar/DeckKit.app，往上两级就是框架根目录。
+// 框架根目录按三步找：
+//   ① 环境变量 DECKKIT_ROOT（测试用）
+//   ② Info.plist 的 DeckkitRoot —— **装到 /Applications 之后靠它**：
+//      那时 Bundle 在 /Applications/DeckKit.app，往上两级是 /，找不到 services/
+//   ③ 兜底：Bundle 在 <deckkit>/menubar/DeckKit.app，往上两级就是框架根目录
 let deckkitRoot: String = {
+    let fm = FileManager.default
+    if let r = ProcessInfo.processInfo.environment["DECKKIT_ROOT"], !r.isEmpty,
+       fm.fileExists(atPath: r + "/services") {
+        return r
+    }
+    if let r = Bundle.main.object(forInfoDictionaryKey: "DeckkitRoot") as? String, !r.isEmpty,
+       fm.fileExists(atPath: r + "/services") {
+        return r
+    }
     // NSString.deletingLastPathComponent 返回 String，要再桥回去才能继续剥。
     let menubar = (Bundle.main.bundlePath as NSString).deletingLastPathComponent as NSString
     return menubar.deletingLastPathComponent

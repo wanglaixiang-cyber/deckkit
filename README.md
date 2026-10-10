@@ -74,7 +74,20 @@ deck doctor                # 环境体检
 
 ## 菜单栏 App
 
-`deckkit/menubar/DeckKit.app` —— 常驻菜单栏，一眼看清 Deck 和所有服务的状态。
+常驻菜单栏，一眼看清 Deck 和所有服务的状态。
+
+```bash
+deck menu --install     # 编译 + 装到 /Applications/DeckKit.app 并启动（推荐）
+deck menu               # 装了之后：编译 → 重新安装 → 重启那份（改动直接生效）
+deck menu --dev         # 只想编仓库里那份（menubar/DeckKit.app），别碰 /Applications
+```
+
+- **装到 `/Applications` 之后那份是正主**：它在 `Info.plist` 的 `DeckkitRoot` 里
+  记着仓库路径，靠它找 `services/` 与 `bin/deck` —— 所以仓库别删、别乱挪，
+  挪了重新 `deck menu --install` 一次。开机自启就加它：
+  系统设置 → 通用 → 登录项 → 添加 `DeckKit.app`。
+- **图标由代码画**（`menubar/makeicon.swift`，官方 logo 的机身标记 + 圆角深色底），
+  仓库里不放二进制素材；`menubar/AppIcon.icns` 是构建产物，不进版本库。
 
 - **图标**：Steam Deck 官方 logo 的机身标记（template image，自动适配浅色/深色菜单栏）；
   Deck 离线时整个图标压暗。

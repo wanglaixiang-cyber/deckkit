@@ -15,3 +15,6 @@ menubar/DeckKit.app/
 *.swp
 __pycache__/
 *.pyc
+
+# 菜单栏 App 的图标：由 menubar/makeicon.swift 画出来（构建产物，不进版本库）
+menubar/AppIcon.icns

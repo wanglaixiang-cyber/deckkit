@@ -662,7 +662,7 @@ cmd_mount_file() {
 # caps：点这个服务时，菜单栏 App 弹文件选择器，然后把选中的 exe 交给
 # mount-file（自己找游戏并挂载）。格式见 docs/约定.md §2.1：
 #   第 1 列 = 选择器里那句话，第 2 列 = 子命令，第 3 列（可选）= 文件类型过滤
-cmd_caps() { printf 'pick 选择官方补丁（exe / 压缩包 / 文件夹都行）—— 自动找 Deck 上对应的游戏并挂载\tmount-file\texe,zip,7z,rar,tar,gz,tgz,xz\n'; }
+cmd_caps() { printf 'pick 选择官方补丁（exe / 压缩包 / 文件夹都行）—— 自动找 Deck 上对应的游戏并挂载\tmount-file\texe,zip,7z,rar,tar,gz,tgz,xz,dir\n'; }
 # 带安装器的补丁走不了 pick（它没有文件清单、没法自动推断目标，得人指定 --game），
 # 所以不给它单独的 pick 条目 —— 那种补丁老老实实在终端跑 add --installer。
 

@@ -675,11 +675,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         //      不列的话"选文件夹"会被系统灰掉，而 patches 的补丁文件夹、
         //      games 的免安装游戏目录都要靠选文件夹。
         if !svc.pickTypes.isEmpty {
-            var types = svc.pickTypes.compactMap { UTType(filenameExtension: $0) }
-            if !types.isEmpty {
-                types.append(.folder)
-                panel.allowedContentTypes = types
-            }
+            // caps 第三列里写 `dir`（或 `*`）才允许选文件夹 —— games 现在要求"选主程序 exe"，
+            // 所以它那行不写 dir，选择器里文件夹就是灰的。
+            let allowDir = svc.pickTypes.contains("*") || svc.pickTypes.contains("dir")
+            panel.canChooseDirectories = allowDir
+            var types = svc.pickTypes.filter { $0 != "dir" && $0 != "*" }
+                .compactMap { UTType(filenameExtension: $0) }
+            if allowDir { types.append(.folder) }
+            if !types.isEmpty { panel.allowedContentTypes = types }
         }
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }

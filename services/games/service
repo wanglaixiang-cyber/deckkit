@@ -5,8 +5,7 @@
 #    deck games              概览 + 已装的游戏（= status）
 #    deck games ls           只列已装的游戏
 #    deck games add <exe>    装：会话准备 → 拉安装器（阻塞）→ 收尾（run.sh / 桌面菜单项）→ 自动登记 Steam
-#    deck games add <目录>   免安装游戏（绿色版/已装好的目录）：拷过去 → 挑主程序 → 登记 Steam
-#    deck games add <主程序>  同上，只是你点的是游戏文件夹里的 game.exe —— 名字不像安装包就按免安装办
+#    deck games add <主程序.exe>  免安装游戏：**你指主程序**，游戏目录按它所在那一层定位（--root 可挪）
 #    deck games cover <名字|all>  生成竖版封面 + 横版头图，写进 Steam 的 grid 目录
 #    deck games fix <名字|all>    维修：重挑主程序（排除 CrashHandler）+ 挪开游戏自带的 Windows 版 DXVK
 #    deck games rm <名字>     卸载：Steam 列表条目 + 游戏本体（目录/prefix），一次清掉
@@ -272,6 +271,7 @@ installer_fingerprint() {   # 在二进制里找安装器自己的招牌字符�
 cmd_install() {
   local exe="" want="" exeopt=""
   local silent="" noshortcut=0 nowait=0 manual=0 direct=1 no_session=0 nocover=0   # 默认：直接拉起（不动 Steam）
+  local rootrel="" from_dir=0
   local force_portable=0 force_installer=0
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -282,6 +282,8 @@ cmd_install() {
       --silent) silent="--silent" ;;          # 静默安装（NSIS 等支持；默认是向导模式）
       --no-shortcut) noshortcut=1 ;;
       --no-cover) nocover=1 ;;                 # 不生成封面（默认装完就写进 Steam 的 grid）
+      --root) shift; rootrel="${1:-}" ;;        # 免安装：以主程序所在层的**哪一层**当游戏根（默认 .）
+      --from-dir) from_dir=1 ;;                 # 免安装：仍按"整个文件夹"装（老路子，自己挑主程序）
       --no-wait) nowait=1; manual=1; direct=0 ;;   # 只准备（不启动、不切会话）
       --manual) manual=1; direct=0 ;;    # 只准备（推包/建 prefix/给步骤），不启动任何东西
       --via-steam) manual=0; direct=0 ;; # 走 Steam（会退出/重启你的 Steam），不推荐
@@ -293,14 +295,21 @@ cmd_install() {
     esac
     shift
   done
-  [ -n "$exe" ] || die "用法：deck games add <setup.exe|游戏目录|游戏主程序.exe> [--name 名字] [--exe 主程序] [--silent] [--no-shortcut]"
+  [ -n "$exe" ] || die "用法：deck games add <setup.exe|游戏主程序.exe> [--name 名字] [--root 相对层级] [--silent] [--no-shortcut]"
   [ -e "$exe" ] || die "找不到文件或目录：$exe"
   require_deck
 
-  # ① 目录 = 免安装游戏（绿色版 / 别人已经装好的那一份）：走另一条更短的路
+  # ① 目录：默认**拒绝** —— 免安装游戏要选主程序 exe（一个目录里常有好几个版本的 exe，
+  #    "按体积猜"就是这么把 UnityCrashHandler32.exe 当主程序装错的）。真要从文件夹装才加 --from-dir。
   if [ -d "$exe" ]; then
     [ "$direct" = 1 ] && [ "$manual" = 0 ] \
       || die "免安装游戏（目录）没有安装器：--silent/--manual/--via-steam/--no-wait 都不适用"
+    if [ "$from_dir" != 1 ]; then
+      die "免安装游戏请**选中目录里的主程序 exe**（游戏目录按主程序定位），别选整个文件夹：
+       deck games add '${exe%/}/<主程序>.exe'
+     目录里若有多个版本（汉化版/原版/不同版本），选文件夹我们只能猜 —— 刚才那款 Unity 游戏
+     就是这么被 UnityCrashHandler32.exe 骗到的。真要按老办法从文件夹装：加 --from-dir"
+    fi
     cmd_add_dir "$exe" "$want" "$noshortcut" "$no_session" "$exeopt" "$nocover"
     return $?
   fi
@@ -323,11 +332,7 @@ cmd_install() {
   if [ -z "$why" ]; then
     [ "$direct" = 1 ] && [ "$manual" = 0 ] \
       || die "免安装游戏没有安装器：--silent/--manual/--via-steam/--no-wait 都不适用"
-    say "${C_DIM}  ==> ${b} 不像安装包 —— 按**免安装游戏的主程序**处理${C_RST}"
-    dim "     会把整个 $(dirname "$exe") 拷到 Deck，并把 ${b} 当游戏主程序"
-    dim "     想按安装包跑：deck games add '$exe' --installer"
-    [ -n "$exeopt" ] || exeopt="$b"        # 选中的这个就是要用的主程序，不用再挑
-    cmd_add_dir "$(dirname "$exe")" "$want" "$noshortcut" "$no_session" "$exeopt" "$nocover"
+    cmd_add_exe "$exe" "$want" "$noshortcut" "$no_session" "$nocover" "$rootrel"
     return $?
   fi
   dim "  按安装包处理（${why}）"
@@ -438,6 +443,59 @@ EOF
   fi
 }
 
+# 免安装游戏（主线）：你给**主程序 exe**，游戏目录 = 它所在那一层（--root 可以挪）。
+# 为什么不让你选文件夹：一个目录里常有好几个 exe（汉化版/原版/不同版本/崩溃处理器），
+# 让程序"按体积猜"猜错是必然 —— 实测 MyGame3 被 UnityCrashHandler32.exe 骗过。
+cmd_add_exe() {
+  local exe="$1" want="$2" noshortcut="$3" no_session="$4" nocover="$5" rootrel="$6"
+  local b srcdir root rel sz
+  b="$(basename "$exe")"
+  srcdir="$(cd "$(dirname "$exe")" && pwd)" || die "拿不到目录：$(dirname "$exe")"
+
+  # 判定 ①：名字就不该启动的东西，直接拒绝
+  if is_uninstaller "$b" || looks_like_installer_name "$b"; then
+    die "$b 看着是安装器/卸载器，不是游戏主程序。
+     真要装安装包：deck games add '$exe' --installer"
+  fi
+  case "$(printf '%s' "$b" | tr 'A-Z' 'a-z')" in
+    *crashhandler*|*crashreport*|*errorreport*|*vc_redist*|*dxsetup*|*dotnet*|*updater*)
+      die "$b 不是游戏主程序（崩溃处理器 / 运行库 / 更新器那一类）—— 选游戏自己的 exe。" ;;
+  esac
+
+  # 游戏根：默认就是主程序所在那一层；--root 可以往上（..）或往下挪
+  root="$(cd "$srcdir/${rootrel:-.}" 2>/dev/null && pwd)" || die "--root 指向的目录不存在：${rootrel:-.}"
+  if [ "$srcdir" = "$root" ]; then
+    rel=""                                            # 主程序就在 root 根下
+  else
+    case "$srcdir" in
+      "$root"/*) rel="${srcdir#"$root"/}" ;;
+      *) die "主程序不在 --root 指定的目录里：$srcdir 不在 $root 下" ;;
+    esac
+  fi
+
+  # 判定 ②：同层还有别的 exe（多版本/多语种就是这种情况）
+  local others
+  # 注意用 sed 去掉 ./ 前缀，别用 -printf（macOS 的 BSD find 没有这个选项，实测静默失败）
+  others="$(cd "$srcdir" && find . -maxdepth 1 -type f -iname '*.exe' ! -iname "$b" 2>/dev/null | sed 's|^\./||' | head -6 | tr '\n' ' ')"
+  [ -n "$others" ] && warn "同目录还有别的 exe：$others
+     确认你要跑的是 ${b}（选错了改：deck games fix <名字> --exe <正确路径>）"
+
+  # 判定 ③：数据可能在上一层（exe 在 bin/ 这类子目录、数据留在外面时）
+  if true; then
+    local up; up="$(dirname "$root")"
+    if [ -d "$up" ] && find "$up" -maxdepth 1 \( -iname 'data' -o -iname '*_Data' -o -iname 'Graphics' -o -iname 'Audio' -o -iname '*.xp3' -o -iname '*.rts' -o -iname 'package.json' \) -print -quit 2>/dev/null | grep -q .; then
+      warn "游戏数据看着在上一层（${up}）—— 要连上一层一起拷：加 --root .."
+    fi
+  fi
+
+  # 判定 ④：太小的 exe 往往是引导器
+  sz="$(stat -f%z "$exe" 2>/dev/null || echo 0)"
+  [ "${sz:-0}" -lt 32768 ] && warn "$b 只有 $((sz / 1024))KB，像引导器/加载器 —— 起不来就换一个 exe 试试"
+
+  say "${C_DIM}  ==> 主程序 $b → 游戏目录 $root${rel:+（主程序在 $rel/ 里）}${C_RST}"
+  cmd_add_dir "$root" "$want" "$noshortcut" "$no_session" "${rel:+$rel/}$b" "$nocover"
+}
+
 # 免安装游戏（绿色版 / 别人已经装好的那份目录）：整份拷到 Deck → 挑主程序 →
 # 写 run.sh → 登记 Steam。没有安装器，于是**不切会话、不开窗口、不阻塞**
 # （只有拷文件这一段要等），也没有"装完再找主程序"的收尾 —— 主程序本来就在目录里。
@@ -490,6 +548,14 @@ cmd_add_dir() {
     [ -n "$gameexe" ] || die "游戏目录里没找到主程序（.exe）—— 用 --exe <相对路径> 指定"
   fi
   ok "游戏主程序 $gameexe"
+  # 拷完复核：按（已改进的）排除规则在**拷过去的目录**里再挑一次，和你选的不一样就提醒
+  if [ -n "${exeopt:-}" ]; then
+    local picked; picked="$(gctl find-game-exe --dir "$gdir" | head -1)"
+    if [ -n "$picked" ] && [ "$picked" != "$gameexe" ]; then
+      warn "按体积/排除规则会挑 $(basename "$picked")，你选的是 $(basename "$gameexe")"
+      dim "  起不来就换：deck games fix ${slug} --exe ${picked#$gdir/}"
+    fi
+  fi
   local gamedir; gamedir="$(dirname "$gameexe")"
   write_launcher "$slug" "$appid" "$proton" "$gamedir" "$gameexe" "$name" || die "写启动脚本失败"
 
@@ -1065,7 +1131,7 @@ cmd_help() {
   cat <<'EOF'
     deck games              已装的游戏
     deck games add <exe>    装（自动切桌面模式、杀 Steam、装完收尾）
-    deck games add <目录|主程序>  免安装游戏（整份拷到 Deck，挑主程序，登记 Steam）
+    deck games add <主程序.exe>  免安装游戏（按主程序定位目录 → 拷到 Deck → 登记 Steam）
     deck games rm <名字>     卸载（Steam 列表条目 + 游戏本体一起清）
     deck games cover <名字|all>  生成封面写进 Steam 的 grid（装完会自动做；用主程序自带图标）
     deck games fix <名字|all>    维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK（点开始没反应时先跑它）
@@ -1082,7 +1148,9 @@ cmd_shortcut_restore() {
   gctl shortcut-restore
 }
 
-cmd_caps() { printf 'pick 选择游戏安装包（setup.exe）或免安装游戏的主程序（game.exe）—— 自动判断\tinstall\t*\n'; }
+# 第三列给的是文件类型过滤：只给 exe（**不写 dir**）→ 选择器里文件夹是灰的。
+# 免安装游戏必须选主程序 exe，不让整份文件夹进来（一个目录里常有好几个版本的 exe）。
+cmd_caps() { printf 'pick 选择安装包（setup.exe）或免安装游戏的主程序（game.exe）\tinstall\texe\n'; }
 usage() { sed -n '2,20p' "$0" | sed 's/^# \?//'; }
 
 case "${1:-status}" in

@@ -5,13 +5,13 @@
 | 你给的 | 判断 | 流程 |
 |---|---|---|
 | 安装包（`setup.exe`、Inno、NSIS…） | 名字里有 setup/install，**或**文件里有安装器指纹（NSIS/Inno/InstallShield…） | 准备会话（切桌面模式 + 退出 Steam）→ Proton 拉起安装器（你点"下一步"）→ 前后快照对比 → 生成启动脚本 → **自动登记进 Steam** |
-| 免安装游戏（整个目录，或游戏文件夹里的 `game.exe`） | 两条都不成立 | 把**它所在的整个目录**拷到 Deck → 在目录里挑主程序（你点的就是 exe 的话直接用它）→ 生成启动脚本 → **自动登记进 Steam**（没有安装器，就不切会话、不开窗口、没什么可等） |
+| 免安装游戏（**你选中它的主程序 `game.exe`**） | 两条都不成立 | 把**主程序所在的那一层**拷到 Deck（`--root ..` 可以连上一层一起拷）→ 生成启动脚本 → **自动登记进 Steam**（没有安装器，就不切会话、不开窗口、没什么可等） |
 
 ```bash
 deck games                            # 概览 + 已装的游戏
 deck games add '<setup.exe>'          # 装安装包（向导窗口出现在 Deck 上，你点完成）
-deck games add '<游戏目录>'            # 免安装：整份拷过去 + 登记
-deck games add '<游戏目录>/game.exe'   # 同上，直接点主程序，不用退到上一层去选目录
+deck games add '<游戏目录>/game.exe'   # 免安装：**选主程序**（游戏目录按它定位）→ 拷过去 + 登记
+deck games add '<主程序>' --root ..     # 主程序在 bin/ 里、数据在上一层：连上一层一起拷
 deck games ls                         # 只列已装的
 deck games shortcut <名字>             # 补登记（装完会自动做）
 deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体（目录/prefix），一次清掉
@@ -41,7 +41,10 @@ deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体�
 
 | 环节 | 做法 |
 |---|---|
+| 定位游戏目录 | **你选的主程序在哪儿，游戏目录就是哪一层**（不用猜）。一个目录里常有好几个 exe（汉化版/原版/不同版本/`UnityCrashHandler32.exe`），「按体积挑」猜错是必然 —— 实测 MyGame3 就是这么装错的。`--root ..` 可以往上一层（主程序在 `bin/`、数据在外面的情况） |
+| 选中就判定 | 名字像 `*CrashHandler*`/`unins*`/`setup*`/redist → **直接拒绝**；同层还有别的 exe → 提示「同目录还有 X，确认跑的是这个」；exe < 32KB（引导器）→ 提醒；上一层看着有 `data/`/`*_Data/`/`*.xp3`/`package.json` → 提示 `--root ..`（都是提醒，不拦你） |
 | 拷到 Deck | `tar \| ssh tar -x`（rsync 在 mac/Deck 版本不一致时会翻车）。落 `~/.local/share/deckkit/games/<slug>/game/` —— 和 `run.sh` 同一目录，于是 `deck games rm` 里那条 `rm -rf` 就把游戏本体一起删了，不留残渣 |
+| 拷完复核 | 用**改进后的排除规则**在拷过去的目录里再挑一遍：挑出来的 ≠ 你选的 → 明确告诉你「按规则会挑 Y，起不来就 `deck games fix <名字> --exe Y`」（这就是「选错了也能救」那一步） |
 | macOS 垃圾 | 两个开关都要：`COPYFILE_DISABLE=1`（不加的话 bsdtar 会给每个带 xattr 的文件附一份 AppleDouble `._名字`，.DS_Store 全排除掉也照样落一地）＋ `--no-xattrs`（不加的话 Deck 的 GNU tar 对每个文件刷一行 `Ignoring unknown extended header keyword`，879M 刷出十几万行） |
 | dir slug | 目录名允许中日文（`mygame`），显示名原样进 Steam |
 | 主程序 | `gamectl find-game-exe --dir <游戏目录>`：排除 unins/setup/redist/… 后取最大的 exe；你点的就是 exe 的话直接用它 |
@@ -134,8 +137,9 @@ deck games fix <名字> --exe 子目录/主程序.exe   # 自己指定主程序
 - **Deck 要在桌面模式**才能看到安装向导 —— 服务会自动切过去，不用你手动切。
 - **更新器式安装器**：有的安装器只落 .NET/运行库 + 它自己的 updater（实测 GameSir Connect
   就是这样：595 个新文件里没有主程序）。`finish` 会报"没找到主程序"并停手 —— 这时别登记 Steam 条目。
-- **免安装是"整份拷贝"**：拷的是**主程序所在那一层**。数据在上一层（比如 exe 在 `bin/` 里、
-  资源在 `bin/..`）时，要么选游戏根目录，要么选根目录那一层的 exe。
+- **免安装拷的是「主程序所在那一层」**：数据在上一层（比如 exe 在 `bin/` 里、资源在 `bin/..`）
+  时加 `--root ..`，或者干脆选上层那个 exe。现在选**文件夹**会被拒绝（除非显式 `--from-dir`）——
+  一个目录里可能有好几个版本，让程序猜不如你指。
 - **卸载会把 Steam grid 里的封面也清掉**（`<appid>p.png` / `.png` / `_header.jpg` /
   `_hero.png` / `_logo.png`，连用户自己的 `.deckkit-bak` 一起）—— 不然会留一堆 appid 已经不存在的
   孤儿图；要留封面就先 `cp` 出来。

@@ -135,16 +135,24 @@ cmd_list() {
 # 精简状态：一行一个服务（终端里的游戏管理页顶部用的就是它，也是"不想看全量"时的一条命令）。
 # 想好看全量：deck status
 cmd_brief() {
-  local s e out
+  local s e d out
+  # 并行取：每个服务一次 status（各自还要 ssh），串行时 4 个服务要 ~10 秒，
+  # 终端里的游戏管理页一进来就得等这么久 —— 并行后只等最慢的那个。
+  d="$(mktemp -d "${TMPDIR:-/tmp}/deck-brief.XXXXXX")" || return 1
   for s in $(services); do
     e="$(svc_entry "$s")"
     if [ -x "$e" ]; then
-      out="$("$e" status 2>/dev/null | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
-      printf '  %s%-10s%s %s\n' "$B" "$s" "$N" "${out:-—}"
+      ( "$e" status 2>/dev/null | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}' > "$d/$s" ) &
     else
-      printf '  %s%-10s%s %s(没有 service 入口)%s\n' "$B" "$s" "$N" "$D" "$N"
+      printf '%s(没有 service 入口)%s' "$D" "$N" > "$d/$s"
     fi
   done
+  wait
+  for s in $(services); do
+    out="$(cat "$d/$s" 2>/dev/null)"
+    printf '  %s%-10s%s %s\n' "$B" "$s" "$N" "${out:-—}"
+  done
+  rm -rf "$d"
   printf '  %s完整状态：deck status · 服务清单：deck list%s\n' "$D" "$N"
 }
 

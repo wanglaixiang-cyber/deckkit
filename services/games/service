@@ -879,14 +879,25 @@ cmd_clean() {
 
 # ─────────────────────── 交互式游戏管理（TUI）───────────────────────
 # 菜单栏那条「游戏管理」走的就是它：**方向键选、回车卸载**，不用记命令。
-# 顶上只放一份精简服务状态（deck brief），要完整状态自己跑 `deck status`。
-# stdin/stdout 不是终端（管道、脚本）时自动退回普通列表。
+# 三条硬规矩（都踩过）：
+#   ① draw() 里**不许有 I/O** —— 一开始每次重画都去跑 `deck brief`（4 个服务 = 4 次 ssh，
+#      好几秒），期间终端 echo 开着，用户按的键被打印成 `^[[A` 又排进输入队列，
+#      每个字节再触发一次重画 → 看起来就是"疯狂刷新、没法交互"。
+#   ② 整个界面期间 `stty -echo`（问 y/N 时临时打开），否则按键会回显到屏幕上。
+#   ③ 方向键要同时认 `ESC[A` 和 `ESC OA`（DECCKM：有些终端/前一个程序会留在应用模式）。
+# 顶部只放一份精简服务状态（`deck brief`，进入和按 r 时各取一次）；完整状态：deck status。
 cmd_tui() {
   if [ ! -t 0 ] || [ ! -t 1 ]; then cmd_list; return 0; fi
   local ROOT; ROOT="$(cd "$SVC_DIR/../.." && pwd)"     # 框架根：$SVC_DIR 是 <root>/services/games
-  local slugs=() names=() sizes=() sel=0 key rest ans i
+  local slugs=() names=() sizes=() sel=0 key rest ans i brief="" echo_off=0
 
-  load_list() {
+  tui_restore() {
+    printf '\033[?25h\033[0m'
+    [ "$echo_off" = 1 ] && stty echo 2>/dev/null
+    echo_off=0
+  }
+
+  load_list() {   # 唯一做 I/O 的地方：列表 + 精简状态（进入/操作后/按 r）
     slugs=(); names=(); sizes=()
     local line slug name size
     while IFS=$'\t' read -r slug name size; do
@@ -899,15 +910,16 @@ cmd_tui() {
                     [ -n "$s" ] || s=$(sed -n "s/^prefix_size=//p" "$d/meta.tsv" | head -1)
                     printf "%s\t%s\t%s\n" "$(basename "$d")" "$n" "$s"
                   done' 2>/dev/null)
+    brief="$("$ROOT/bin/deck" brief 2>/dev/null)"
     [ "$sel" -ge "${#slugs[@]}" ] && sel=$(( ${#slugs[@]} > 0 ? ${#slugs[@]} - 1 : 0 ))
+    return 0
   }
 
-  draw() {
+  draw() {        # 纯渲染：不跑命令、不联网（否则按键就会"疯狂刷新"）
     printf '\033[H\033[2J'
-    printf '%s%s  deckkit · 游戏管理%s\n' "$C_B" "$C_B" "$C_RST"
+    printf '%s  deckkit · 游戏管理%s\n' "$C_B" "$C_RST"
     printf '%s\n' "───────────────────────────────────────────────"
-    # 精简服务状态：一行一个服务（完整状态：deck status）
-    "$ROOT/bin/deck" brief 2>/dev/null | sed 's/^/  /'
+    [ -n "$brief" ] && printf '%s\n' "$brief" | sed 's/^/  /'
     printf '%s\n' "───────────────────────────────────────────────"
     if [ "${#slugs[@]}" = 0 ]; then
       printf '  （还没有装过游戏）\n'
@@ -931,33 +943,39 @@ cmd_tui() {
 
   do_action() {   # 把界面让开，跑一条命令，再回来
     local slug="$1"; shift
-    printf '\033[?25h'
+    tui_restore
     printf '\n'
     "$@" || warn "这条命令失败了"
     printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
     IFS= read -r ans
     printf '\033[?25l'
+    [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }
     load_list
   }
 
-  trap 'printf "\033[?25h\033[0m\n"; exit 0' INT TERM
+  trap 'tui_restore; exit 0' INT TERM
+  [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }
   printf '\033[?25l'
+  # 先立刻出一帧，别让用户对着空屏等（状态和列表要几秒）
+  printf '\033[H\033[2J  %sdeckkit · 游戏管理%s\n\n  %s正在读取服务状态和游戏列表…%s\n' "$C_B" "$C_RST" "$C_DIM" "$C_RST"
   load_list
+  local last_sel=-1
   while :; do
-    draw
+    [ "$sel" != "$last_sel" ] && { draw; last_sel="$sel"; }
+    [ "${#slugs[@]}" = 0 ] && [ "$last_sel" = -2 ] || true
     IFS= read -rsn1 key || break
     if [ "$key" = $'\033' ]; then
       IFS= read -rsn2 -t 1 rest || rest=""
       key="$key$rest"
     fi
     case "$key" in
-      $'\033[A'|k)
+      $'\033[A'|$'\033OA'|k)
         sel=$(( sel > 0 ? sel - 1 : ${#slugs[@]} - 1 )) ;;
-      $'\033[B'|j)
+      $'\033[B'|$'\033OB'|j)
         sel=$(( sel < ${#slugs[@]} - 1 ? sel + 1 : 0 )) ;;
       ''|$'\n'|$'\r')
         [ "${#slugs[@]}" = 0 ] && continue
-        printf '\033[?25h'
+        tui_restore
         printf '\n  卸载 %s%s%s（游戏本体 + Steam 条目 + 封面，不可恢复）\n' "$C_B" "${names[$sel]}" "$C_RST"
         printf '  注：会顺带退出 Steam（要写 shortcuts.vdf），需要的话还会切到桌面模式。\n'
         printf '  确认卸载？[y/N] '
@@ -966,22 +984,26 @@ cmd_tui() {
           cmd_uninstall "${slugs[$sel]}" --yes --with-shortcut
           printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
           IFS= read -r ans
-          load_list
         else
           printf '  已取消'
         fi
-        printf '\033[?25l' ;;
+        printf '\033[?25l'
+        [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }
+        load_list
+        last_sel=-1 ;;
       c)
         [ "${#slugs[@]}" = 0 ] && continue
-        do_action "${slugs[$sel]}" cmd_cover "${slugs[$sel]}" ;;
+        do_action "${slugs[$sel]}" cmd_cover "${slugs[$sel]}"
+        last_sel=-1 ;;
       f)
         [ "${#slugs[@]}" = 0 ] && continue
-        do_action "${slugs[$sel]}" cmd_fix "${slugs[$sel]}" ;;
-      r) load_list ;;
+        do_action "${slugs[$sel]}" cmd_fix "${slugs[$sel]}"
+        last_sel=-1 ;;
+      r) load_list; last_sel=-1 ;;
       q|Q) break ;;
     esac
   done
-  printf '\033[?25h\033[0m'
+  tui_restore
   return 0
 }
 

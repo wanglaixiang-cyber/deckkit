@@ -1,0 +1,19 @@
+[Unit]
+Description=deckkit/files：把 Steam Deck 家目录以 WebDAV 暴露给 Mac 访达
+After=network.target
+
+[Service]
+Type=simple
+# 共享整个家目录；rclone 是 NFS 挂不上时的回退通道。
+ExecStart=%h/bin/rclone serve webdav %h \
+    --addr :8088 \
+    --dir-cache-time 30s \
+    --vfs-cache-mode off \
+    --log-level INFO
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

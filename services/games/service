@@ -1,0 +1,838 @@
+#!/usr/bin/env bash
+# ============================================================
+#  deckkit / games —— 服务入口（Mac 侧）
+#
+#    deck games              概览 + 已装的游戏（= status）
+#    deck games ls           只列已装的游戏
+#    deck games add <exe>    装：会话准备 → 拉安装器（阻塞）→ 收尾（run.sh / 桌面菜单项）→ 自动登记 Steam
+#    deck games add <目录>   免安装游戏（绿色版/已装好的目录）：拷过去 → 挑主程序 → 登记 Steam
+#    deck games add <主程序>  同上，只是你点的是游戏文件夹里的 game.exe —— 名字不像安装包就按免安装办
+#    deck games rm <名字>     卸载：Steam 列表条目 + 游戏本体（目录/prefix），一次清掉
+#    deck games shortcut <名字>           单独（重新）登记 Steam 条目（install 收尾时已自动做）
+#    deck games shortcut-remove <名字>     只移除 Steam 条目
+#    deck games protons / shortcut-check / clean / help-all
+#
+#  装/卸的会话准备是自动的（幂等）：不在桌面模式就切过去，Steam 在跑就退出
+#  （先请它自己退，20 秒不退再强杀；强杀常把 shortcuts.vdf 清成 0 字节 → 自动从备份恢复）。
+#  安装器窗口由我们用 Proton 直接拉起（要关掉 Xalia、并给出桌面会话的 XAUTHORITY）。
+#  与 patches 的关系：内核相同（prefix + Proton + 显示会话 + 前后快照），
+#  区别只在于用**新建的** prefix、装到新目录，并按需登记 Steam 条目。
+#  安装器里点"下一步"这一步天然由人在 Deck 上完成（去掉 --silent 就是向导模式）。
+#
+#  免安装游戏（add <目录>）把上面这些**绕掉一大半**：没有安装器，就不需要
+#  显示会话、不需要前后快照、也没有"装完再找主程序"的收尾 —— 主程序就在拷过去的
+#  目录里，拷完直接挑。剩下的只有：空 prefix（第一次启动 Proton 自己初始化）、
+#  run.sh、登记 Steam（写 shortcuts.vdf 仍然要求 Steam 不在跑，这一步照旧自动做）。
+#  游戏文件落 ~/.local/share/deckkit/games/<slug>/game/ —— 和 run.sh 同一个目录，
+#  于是 `deck games rm` 那一条 rm -rf 就把游戏本体一起删了（不留残渣）。
+# ============================================================
+set -uo pipefail
+
+SVC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MAC_DIR="${SVC_DIR}/mac"
+DECK_DIR="${SVC_DIR}/deck"
+
+cfg_get() { sed -n "s/^$1=[\"']\{0,1\}\([^\"'#]*\).*/\1/p" "$MAC_DIR/config.env" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+
+DECK_SSH="$(cfg_get DECK_SSH)";           DECK_SSH="${DECK_SSH:-deck}"
+DECK_HOST="$(cfg_get DECK_HOST)";         DECK_HOST="${DECK_HOST:-steamdeck.local}"
+DECK_GAMES_ROOT="$(cfg_get DECK_GAMES_ROOT)"; DECK_GAMES_ROOT="${DECK_GAMES_ROOT:-~/deckkit/services/games}"
+SSH_TIMEOUT="$(cfg_get SSH_TIMEOUT)";     SSH_TIMEOUT="${SSH_TIMEOUT:-10}"
+KEEP_INSTALLER_ON_DECK="$(cfg_get KEEP_INSTALLER_ON_DECK)"
+
+if [ -t 1 ]; then
+  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+else C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; fi
+say()  { printf '%s\n' "$*"; }
+hdr()  { printf '\n%s%s%s\n' "$C_B" "$*" "$C_RST"; }
+dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST"; }
+ok()   { printf '  %s\xe2\x9c\x93%s %s\n' "$C_GRN" "$C_RST" "$*"; }
+warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RST" "$*"; }
+bad()  { printf '  %s\xe2\x9c\x97%s %s\n' "$C_RED" "$C_RST" "$*"; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+SSH_MUX=(-o ControlMaster=auto -o ControlPath="$HOME/.ssh/deckkit-cm-%r@%h:%p" -o ControlPersist=15s)
+SSH_OPTS=(-o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SSH_MUX[@]}")
+rsh() { ssh "${SSH_OPTS[@]}" "$DECK_SSH" "$@"; }
+deck_up() { rsh true >/dev/null 2>&1; }
+require_deck() { deck_up || die "Deck（${DECK_HOST}）连不上"; }
+
+# 在 Deck 上跑 gamectl
+gctl() {
+  local args="" a
+  for a in "$@"; do args="$args $(printf '%q' "$a")"; done
+  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "bash \"\${HOME}/deckkit/services/games/gamectl.sh\"$args"
+}
+
+# 目录/文件名 → slug（Deck 上的目录名，也是 appid 的输入之一）。
+# 原来的 `[^a-z0-9] → -` 会把日文名削成 "ver1-01" 这种没意义的东西；
+# 这里保留 \w（含中日文）—— ext4 + UTF-8 下日文目录名没有任何问题。
+slugify() {
+  python3 -c '
+import re, sys
+s = re.sub(r"\.exe$", "", sys.argv[1], flags=re.I).lower()
+print(re.sub(r"[^\w]+", "-", s, flags=re.U).strip("-_")[:40])
+' "$1"
+}
+
+# Steam 给非 Steam 快捷方式算的 appid：crc32("exe" + 名字) | 0x80000000
+# 一定要和将来写进 shortcuts.vdf 的 Exe 完全一致，否则 prefix 对不上。
+appid_for() {
+  python3 -c 'import sys,zlib; print((zlib.crc32(("\""+sys.argv[1]+"\""+sys.argv[2]).encode()) | 0x80000000) & 0xffffffff)' "$1" "$2"
+}
+
+# Proton 目录名 → Steam 内部 compat 工具名（config.vdf 里用）
+compat_name() {
+  case "$1" in
+    *Experimental*)  printf 'proton_experimental' ;;
+    *Hotfix*)        printf 'proton_hotfix' ;;
+    *[0-9]*)         printf 'proton_%s' "$(printf '%s' "$1" | grep -oE '[0-9]+' | head -1)" ;;
+    *)               printf 'proton_experimental' ;;
+  esac
+}
+
+# Deck 上最新的一版 Proton（数字版里最大的优先，其次 Experimental/Hotfix）
+deck_proton() {
+  local p; p="$(gctl protons | grep -E '^Proton [0-9]' | sort -t' ' -k2 -V | tail -1)"
+  [ -n "$p" ] || p="$(gctl protons | head -1)"
+  printf '%s' "$p"
+}
+
+# ---------- 会话切换（Game Mode ⇄ Desktop Mode）----------
+in_desktop_mode() { rsh 'pgrep -x plasmashell >/dev/null 2>&1'; }
+in_game_mode()    { rsh 'pgrep -x gamescope >/dev/null 2>&1'; }
+switch_session() {   # desktop | game
+  case "$1" in
+    desktop) rsh 'steamosctl switch-to-desktop-mode >/dev/null 2>&1 || steamos-session-select plasma-wayland-persistent >/dev/null 2>&1' ;;
+    game)    rsh 'steamosctl switch-to-game-mode    >/dev/null 2>&1 || steamos-session-select gamescope >/dev/null 2>&1' ;;
+  esac
+}
+wait_session() {     # desktop | game，最多等 3 分钟
+  local want="$1" i=0
+  while [ $i -lt 60 ]; do
+    if [ "$want" = desktop ]; then in_desktop_mode && return 0; else in_game_mode && return 0; fi
+    sleep 3; i=$((i + 1))
+  done
+  return 1
+}
+
+# 等"会话的自启动阶段真的结束"——正向信号，而不是"此刻没看到 Steam"（负向、有竞态）。
+# KDE 会给每个 xdg autostart 项生成 app-<名字>@autostart.service，全部落定后
+# xdg-desktop-autostart.target 才是 active；那之后不会有新的自启项再冒出来。
+wait_session_ready() {
+  local i=0 st
+  while [ $i -lt 20 ]; do
+    # 只看**状态列**（第 3 列）：单元名里都含 "autostart"，用 grep 匹配名字会把它们全算进去
+    st="$(rsh 'printf "%s|" "$(systemctl --user is-active xdg-desktop-autostart.target 2>/dev/null)"; systemctl --user list-units --no-legend --plain "app-*@autostart.service" 2>/dev/null | awk "{print \$3}" | grep -cE "^(activating|start)$"' 2>/dev/null)"
+    case "$st" in
+      active\|0*) return 0 ;;      # 目标 active，且没有还在启动的自启项 → 就绪
+    esac
+    sleep 3; i=$((i + 1))
+  done
+  warn "会话自启阶段 60 秒内没落定（继续，但 Steam 可能稍后冒出来）"
+  return 1
+}
+
+# 桌面模式（KDE）的会话一启动就会执行 /etc/xdg/autostart/steam.desktop
+# （Exec=/usr/bin/steam -silent），所以只要我们切到桌面模式，Steam 就会被拉起来 ——
+# 这就是"安装过程中 Steam 老是自动启动"的根源。用**用户级同名覆盖 + Hidden=true**
+# 临时压住它（XDG 标准做法），命令结束时（EXIT trap）恢复原状。
+STEAM_AUTOSTART="$HOME/.config/autostart/steam.desktop"   # 只是本地变量名，实际操作在 Deck 上
+mask_steam_autostart() {
+  rsh 'mkdir -p "$HOME/.config/autostart"
+       [ -f "$HOME/.config/autostart/steam.desktop" ] && cp -f "$HOME/.config/autostart/steam.desktop" "$HOME/.config/autostart/steam.desktop.deckkit-bak"
+       printf "[Desktop Entry]\nType=Application\nName=Steam\nHidden=true\n" > "$HOME/.config/autostart/steam.desktop"
+       systemctl --user mask --runtime steam-launcher >/dev/null 2>&1
+       systemctl --user stop steam-launcher >/dev/null 2>&1'
+  trap 'unmask_steam_autostart' EXIT INT TERM
+}
+unmask_steam_autostart() {
+  rsh 'if [ -f "$HOME/.config/autostart/steam.desktop.deckkit-bak" ]; then
+         mv -f "$HOME/.config/autostart/steam.desktop.deckkit-bak" "$HOME/.config/autostart/steam.desktop"
+       else
+         rm -f "$HOME/.config/autostart/steam.desktop"
+       fi
+       systemctl --user unmask --runtime steam-launcher >/dev/null 2>&1' 2>/dev/null
+}
+
+# 会话准备：不在桌面模式就切过去，Steam 在跑就杀掉（用户要求：
+# "如果和 Steam 存在冲突或者检测到不在桌面模式，就切换到桌面模式 + 杀掉 Steam 进程再执行"）
+# 目录/进程都不符合时是**幂等**的，已经就绪就什么都不做。
+ensure_session() {
+  local no_session="${1:-0}"
+  [ "$no_session" = 1 ] && return 0
+  # 会话准备（默认执行，用户要求）：Gaming 模式就切到桌面模式，然后杀掉 Steam 进程。
+  # 用户明确说不用管游戏有没有退出/保存，所以这里**不做**任何"有游戏在跑就拒绝"的判断。
+    hdr "准备会话"
+    if ! in_desktop_mode; then
+      say "${C_DIM}  ==> 从 Gaming 模式切到桌面模式${C_RST}"
+      switch_session desktop || die "切换失败（steamosctl / steamos-session-select 都没生效？）"
+      wait_session desktop || die "桌面模式 3 分钟没起来"
+      wait_session_ready          # 关键：等自启阶段结束，再去看 Steam
+    else
+      dim "  已经在桌面模式"
+      wait_session_ready
+    fi
+    # 会话切换是**异步**的：plasmashell 起来了只代表会话开始启动，之后它还会继续跑
+    # xdg autostart / graphical-session.target 那套 —— Steam 常常在"我们检查完之后"
+    # 才冒出来（用户实测：检查时没在跑，进到安装器那一步才出现）。所以这里反复
+    # "等落定 → 退 → 再确认"，最多四轮；每轮都真的验证它不会再出现。
+    local round=0
+    while [ $round -lt 4 ]; do
+      if ! rsh 'pgrep -x steam >/dev/null 2>&1'; then
+        sleep 6                      # 给会话/自启留出冒头的时间，看它会不会自己起来
+        if ! rsh 'pgrep -x steam >/dev/null 2>&1'; then
+          dim "  Steam 确认没在跑"
+          break
+        fi
+        dim "  Steam 刚冒出来（会话启动还没落定）—— 再退一次"
+      fi
+      say "${C_DIM}  ==> 退出 Steam（先请它自己退，好让它把 shortcuts.vdf 写完；不退就强杀）${C_RST}"
+      rsh 'timeout 25 steam -shutdown >/dev/null 2>&1' || true   # Steam CLI 会卡住不返回，加超时
+      local w=0; while [ $w -lt 20 ]; do rsh 'pgrep -x steam' >/dev/null 2>&1 || break; sleep 2; w=$((w+1)); done
+      if rsh 'pgrep -x steam >/dev/null 2>&1'; then
+        dim "  Steam 没自己退，强杀"
+        rsh 'pkill -TERM -x steam >/dev/null 2>&1' || true; sleep 5
+        rsh 'pkill -KILL -x steam >/dev/null 2>&1; pkill -KILL -x steamwebhelper >/dev/null 2>&1' || true
+        sleep 2
+      fi
+      round=$((round + 1))
+    done
+    rsh 'pgrep -x steam >/dev/null 2>&1' && warn "Steam 还在（写条目时可能需要再退一次；真退不掉就手动退）"
+    # Steam 进程退了不代表它写完了：它的最后一次写盘可能晚一两秒落地，
+    # 我们若立刻写 shortcuts.vdf，就会被它随后覆盖（用户实测：条目写进去又消失）。
+    # 这里等这个文件的大小稳定下来（最多约 12 秒）再继续。
+    local s1 s2 k=0
+    s1="$(rsh 'stat -c %s \"\$HOME/.steam/steam/userdata\"/*/config/shortcuts.vdf 2>/dev/null | head -1')"
+    while [ $k -lt 6 ]; do
+      sleep 2
+      s2="$(rsh 'stat -c %s \"\$HOME/.steam/steam/userdata\"/*/config/shortcuts.vdf 2>/dev/null | head -1')"
+      [ "$s1" = "$s2" ] && break
+      s1="$s2"; k=$((k + 1))
+    done
+    # 注意：这里**不**去翻备份恢复 —— 合并备份会把你主动删掉的条目复活（用户反馈过）。
+    # 文件不在/为空就当"没有快捷方式"，由 shortcut-add 从空结构起写。
+    if ! gctl shortcut-check >/dev/null 2>&1; then
+      dim "  shortcuts.vdf 不在或已是空的（Steam 被强杀时常见）—— 会当成"还没有快捷方式"来写"
+    fi
+}
+
+# 启动脚本在 **Deck** 上的路径。这里必须硬写 Deck 的家目录（/home/deck）：
+# 之前用本地 $HOME 结果把 Mac 路径写进了 meta 和 Steam 条目的 Exe（点开无效，实测踩过）。
+launcher_path() { printf '/home/deck/.local/share/deckkit/games/%s/run.sh' "$1"; }
+
+write_launcher() {   # 在 Deck 上写启动脚本（Steam 快捷方式的 Exe 指向它）
+  local slug="$1" appid="$2" proton="$3" gamedir="$4" gameexe="$5" name="$6"
+  rsh "mkdir -p \"\$HOME/.local/share/deckkit/games/$slug\""
+  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\$HOME/.local/share/deckkit/games/$slug/run.sh\"" <<EOF
+#!/usr/bin/env bash
+# deckkit games: $name  （deckkit 自动生成，别手改；要改就重跑 deck games add）
+# LANG 兜底：Deck 上目录名可能是日文/中文，而 wine 需要一个 UTF-8 的 locale 才认这些
+# 路径 —— 实测 LANG 没设时 game.exe 起得来、DXVK 一个交换链都不建（窗口永不出现），
+# 设成 C.UTF-8（不挑语言，只要求 UTF-8）就正常渲染。Steam 启动时本来就有 LANG，
+# 这里只补"没人给它"的情况。
+export LANG="\${LANG:-C.UTF-8}"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="\$HOME/.steam/steam"
+export STEAM_COMPAT_DATA_PATH="\$HOME/.steam/steam/steamapps/compatdata/$appid"
+cd "$gamedir" || exit 1
+exec "\$HOME/.steam/steam/steamapps/common/$proton/proton" run "$gameexe" "\$@"
+EOF
+  rsh "chmod 755 \"\$HOME/.local/share/deckkit/games/$slug/run.sh\""
+}
+
+# —— 选中的是"安装包"还是"免安装游戏的主程序"？——
+# 这不是学术问题：菜单栏那条路就是直接在游戏文件夹里点 game.exe，而同一个选择器
+# 也要能点 setup.exe。两条判据，名字不够就问二进制：
+#   1) 名字：setup.exe / xx_installer.exe / vcredist / dxsetup / dotnet / updater
+#   2) 指纹：NSIS / Inno Setup / InstallShield 这些安装器都会在文件里留下自己的名字
+#      —— 实测 OpenTTD 的安装包叫 openttd-14.1-windows-win64.exe，名字里没有 setup，
+#      只看名字会把它当成绿色版游戏。
+# 猜错最多是白跑一趟，所以还留了 --portable / --installer 两个显式开关。
+looks_like_installer_name() {
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *setup*.exe|*install*.exe|*vcredist*.exe|*dxsetup*.exe|*dotnet*.exe|*updater*.exe) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+is_uninstaller() {
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    *unins*.exe|*uninstall*.exe) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+installer_fingerprint() {   # 在二进制里找安装器自己的招牌字符串
+  LC_ALL=C grep -qaE 'Nullsoft Install System|Nullsoft\.NSIS|Inno Setup Setup Data|InstallShield|WISE Installation|Setup Factory|InstallAnywhere' "$1" 2>/dev/null
+}
+
+cmd_install() {
+  local exe="" want="" exeopt=""
+  local silent="" noshortcut=0 nowait=0 manual=0 direct=1 no_session=0   # 默认：直接拉起（不动 Steam）
+  local force_portable=0 force_installer=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) shift; want="${1:-}" ;;
+      --exe) shift; exeopt="${1:-}" ;;        # 免安装：指定主程序（相对游戏目录）
+      --portable) force_portable=1 ;;          # 强制按"免安装游戏"处理
+      --installer) force_installer=1 ;;        # 强制按"安装包"处理
+      --silent) silent="--silent" ;;          # 静默安装（NSIS 等支持；默认是向导模式）
+      --no-shortcut) noshortcut=1 ;;
+      --no-wait) nowait=1; manual=1; direct=0 ;;   # 只准备（不启动、不切会话）
+      --manual) manual=1; direct=0 ;;    # 只准备（推包/建 prefix/给步骤），不启动任何东西
+      --via-steam) manual=0; direct=0 ;; # 走 Steam（会退出/重启你的 Steam），不推荐
+      --direct) direct=1; manual=0 ;;    # 默认行为，显式写一遍也行
+      --auto-session) no_session=0 ;;    # 兼容旧写法（现在这是默认行为）
+      --no-session) no_session=1 ;;      # 跳过"切桌面模式 + 杀 Steam"（自己已经准备好时用）      # 只做准备工作，不等安装（自己装完后跑 finish）
+      -*) die "install: 不认识的选项 $1" ;;
+      *) exe="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$exe" ] || die "用法：deck games add <setup.exe|游戏目录|游戏主程序.exe> [--name 名字] [--exe 主程序] [--silent] [--no-shortcut]"
+  [ -e "$exe" ] || die "找不到文件或目录：$exe"
+  require_deck
+
+  # ① 目录 = 免安装游戏（绿色版 / 别人已经装好的那一份）：走另一条更短的路
+  if [ -d "$exe" ]; then
+    [ "$direct" = 1 ] && [ "$manual" = 0 ] \
+      || die "免安装游戏（目录）没有安装器：--silent/--manual/--via-steam/--no-wait 都不适用"
+    cmd_add_dir "$exe" "$want" "$noshortcut" "$no_session" "$exeopt"
+    return $?
+  fi
+
+  # ② 文件：安装包 vs 免安装游戏的主程序（--portable / --installer 可以改判）
+  local b="" why=""
+  b="$(basename "$exe")"
+  if is_uninstaller "$b"; then
+    die "$b 是卸载器，不是安装包。要卸载跑：deck games rm <名字>"
+  fi
+  if [ "$force_installer" = 1 ]; then
+    why="你指定了 --installer"
+  elif [ "$force_portable" = 1 ]; then
+    why=""
+  elif looks_like_installer_name "$b"; then
+    why="名字像安装包（setup/install…）"
+  elif installer_fingerprint "$exe"; then
+    why="文件里有安装器指纹（NSIS/Inno/InstallShield…）"
+  fi
+  if [ -z "$why" ]; then
+    [ "$direct" = 1 ] && [ "$manual" = 0 ] \
+      || die "免安装游戏没有安装器：--silent/--manual/--via-steam/--no-wait 都不适用"
+    say "${C_DIM}  ==> ${b} 不像安装包 —— 按**免安装游戏的主程序**处理${C_RST}"
+    dim "     会把整个 $(dirname "$exe") 拷到 Deck，并把 ${b} 当游戏主程序"
+    dim "     想按安装包跑：deck games add '$exe' --installer"
+    [ -n "$exeopt" ] || exeopt="$b"        # 选中的这个就是要用的主程序，不用再挑
+    cmd_add_dir "$(dirname "$exe")" "$want" "$noshortcut" "$no_session" "$exeopt"
+    return $?
+  fi
+  dim "  按安装包处理（${why}）"
+
+  local base; base="$(basename "$exe")"
+  local slug; slug="$(slugify "${want:-$base}")"
+  [ -n "$slug" ] || die "无法从文件名推断名字，用 --name 指定"
+  local name="${want:-$slug}"
+
+  local rdir="$DECK_GAMES_ROOT/store/$slug"
+  rsh "mkdir -p \"\${HOME}/deckkit/services/games/store/$slug\"" || die "Deck 上建目录失败"
+  say "${C_DIM}==> 上传安装包（永久留一份在 Deck）${C_RST}"
+  rsync -a "$exe" "$DECK_SSH:$rdir/setup.exe" || die "上传失败"
+
+  # 1) appid / prefix（先定 appid，安装的东西才会落在这个 prefix 里）
+  local launcher; launcher="$(launcher_path "$slug")"
+  local appid; appid="$(appid_for "$launcher" "$name")"
+  hdr "准备 Proton 环境"
+  ok "名字 ${name}"
+  ok "appid ${appid}（= crc32(\"启动脚本\"+名字)，和 Steam 的算法一致）"
+  gctl prefix "$appid" >/dev/null || die "建 prefix 失败"
+  local proton; proton="$(deck_proton)"
+  [ -n "$proton" ] || die "Deck 上没有 Proton"
+  ok "Proton ${proton}"
+
+  # 2) 安装前快照
+  local pfx="/home/deck/.steam/steam/steamapps/compatdata/$appid"
+  gctl snapshot "$pfx" > /tmp/deckkit-games-before.tsv || true
+
+  # 记下起点：finish 靠它判断「哪些 prefix 是这次装的」
+  local started; started="$(date '+%s')"
+  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/games/store/$slug/start.tsv\"" <<EOF
+slug=$slug
+appid=$appid
+name=$name
+proton=$proton
+rdir=$rdir
+exe=$exe
+started_at=$(date '+%Y-%m-%d %H:%M:%S')
+started_epoch=$started
+EOF
+
+  # 3) 交给 Steam 跑（**不要**用 ssh 直跑 proton run：Proton 自带的 Xalia 在
+  #    非 Steam 上下文里会崩，窗口根本不会出现 —— 实测踩过）
+  [ "$direct" = 1 ] && ensure_session "$no_session"
+
+  local interrupted=0
+  # Ctrl-C 只置标志、不退出：安装往往已经完成了，让流程继续走到收尾
+  # （之前 Ctrl-C 直接退出 → finish/注册全丢；而安装器的完成页常常让进程多赖一会儿）
+  trap 'interrupted=1' INT
+  if [ "$direct" = 1 ]; then
+    hdr "在 Deck 上拉起安装器"
+    dim "  向导窗口会出现在 Deck 屏幕上（Xalia 已关、桌面凭证自动解析），你点完成即可"
+    dim "  这一步是**阻塞**的：一直等到安装器进程退出（你点完 Finish / 关掉窗口）才返回"
+    gctl run "$appid" "$rdir/setup.exe" $silent || warn "安装器退出码非 0（有些装完会返回非 0，先继续）"
+    if [ "$interrupted" = 1 ]; then
+      warn "你中断了等待 —— 不过安装可能已经完成，照样继续收尾（这正是要的效果）"
+    else
+      ok "安装器已退出 —— 开始收尾"
+    fi
+  fi
+  if [ "$manual" = 1 ]; then
+    hdr "手工方式（你自己在 Steam 里加）"
+    dim "  ① 在 Deck 上：Steam → 游戏 → 添加非 Steam 游戏 → 浏览到"
+    dim "       $rdir/setup.exe"
+    dim "  ② 库里右键它 → 属性 → 兼容性 → 强制使用 ${proton}"
+    dim "  ③ 启动它，走完安装向导"
+    dim "  ④ 装完后跑：deck games finish ${slug}"
+    return 0
+  elif [ "$direct" = 0 ]; then
+    # 由我们代劳：写快捷方式（指向安装器）+ 设「强制 Proton」+ 起 Steam + applaunch
+    local inst_appid inst_name
+    inst_name="$name 安装器"
+    inst_appid="$(appid_for "$rdir/setup.exe" "$inst_name")"
+    if rsh 'pgrep -x steam >/dev/null'; then
+      say "${C_DIM}  先退出 Steam（改 shortcuts.vdf/config.vdf 需要它不在运行）${C_RST}"
+      rsh 'timeout 25 steam -shutdown >/dev/null 2>&1' || true   # Steam CLI 会卡住不返回，加超时
+      local w=0; while [ $w -lt 30 ]; do rsh 'pgrep -x steam' >/dev/null || break; sleep 2; w=$((w+1)); done
+      rsh 'pgrep -x steam' >/dev/null && die "Steam 没退出（先手动退出 Steam 再重跑，或加 --manual 自己装）"
+    fi
+    if ! rsh "test -f \"\${HOME}/.steam/steam/userdata/*/config/shortcuts.vdf\"" 2>/dev/null; then
+      warn "live 的 shortcuts.vdf 不在（上次 Steam 退出时被删了）—— 先从备份恢复"
+      gctl shortcut-restore || die "恢复失败，请先手动启动一次 Steam 让它重建 shortcuts.vdf"
+    fi
+    gctl shortcut-add "$inst_appid" "$inst_name" "$rdir/setup.exe" "$rdir" "" || die "写快捷方式失败"
+    rsh "python3 \"\${HOME}/deckkit/services/games/compat-tool.py\" --set $inst_appid $(compat_name "$proton")" || warn "设「强制 Proton」失败，需要在 Steam 属性里手动选一次"
+    ok "快捷方式 + 强制 Proton 已写好（appid ${inst_appid}）"
+    say "${C_DIM}  启动 Steam 并拉起安装器…${C_RST}"
+    rsh 'systemctl --user start steam-launcher' >/dev/null 2>&1 || true
+    local w=0; while [ $w -lt 40 ]; do rsh 'pgrep -x steam' >/dev/null && break; sleep 3; w=$((w+1)); done
+    sleep 10
+    rsh "steam -applaunch $inst_appid" >/dev/null 2>&1 || warn "applaunch 返回非 0（也许已经开始跑了）"
+    dim "  装完后跑：deck games finish ${slug}"
+    return 0
+  fi
+  if cmd_finish "$slug" "$appid" "$name" "$proton" "$rdir" "$exe"; then
+    if [ "$noshortcut" = 1 ]; then
+      dim "  按 --no-shortcut 跳过 Steam 登记；要登记随时跑：deck games shortcut ${slug}"
+    else
+      # 装完自动进 Steam「非 Steam 游戏」——会话准备已在开头做过，此刻 Steam 没在跑
+      hdr "登记进 Steam「非 Steam 游戏」"
+      ensure_session "$no_session"     # 写之前再确认一遍（幂等；会话已就绪时几乎不花时间）
+      cmd_shortcut "$slug" || warn "自动登记失败，装完后手动跑：deck games shortcut ${slug}"
+      dim "  切回 Gaming 模式就能在库里看到它（steamosctl switch-to-game-mode，或自己切）"
+    fi
+  fi
+}
+
+# 免安装游戏（绿色版 / 别人已经装好的那份目录）：整份拷到 Deck → 挑主程序 →
+# 写 run.sh → 登记 Steam。没有安装器，于是**不切会话、不开窗口、不阻塞**
+# （只有拷文件这一段要等），也没有"装完再找主程序"的收尾 —— 主程序本来就在目录里。
+cmd_add_dir() {
+  local dir="$1" want="$2" noshortcut="$3" no_session="$4" exeopt="$5"
+
+  local base name slug
+  base="$(basename "$dir")"
+  name="${want:-$base}"
+  slug="$(slugify "$name")"
+  [ -n "$slug" ] || die "无法从目录名推断名字，用 --name 指定"
+
+  local launcher; launcher="$(launcher_path "$slug")"
+  local appid; appid="$(appid_for "$launcher" "$name")"
+  local gdir="/home/deck/.local/share/deckkit/games/$slug/game"
+  local pfx="/home/deck/.steam/steam/steamapps/compatdata/$appid"
+
+  hdr "免安装游戏"
+  ok "名字 ${name}（slug ${slug}）"
+  ok "appid ${appid}（= crc32(\"启动脚本\"+名字)，和 Steam 的算法一致）"
+
+  hdr "拷到 Deck"
+  say "${C_DIM}  ==> $(du -sh "$dir" 2>/dev/null | cut -f1) → $gdir${C_RST}"
+  rsh "mkdir -p \"\${HOME}/deckkit/services/games/store/$slug\" \"\$HOME/.local/share/deckkit/games/$slug/game\"" \
+    || die "Deck 上建目录失败"
+  # tar 走 ssh：rsync 在两边版本不一致时会翻车，tar 不会；顺手把苹果的垃圾挡掉。
+  # COPYFILE_DISABLE=1 + --no-xattrs 两个都要：
+  #   · 不加 COPYFILE_DISABLE，bsdtar 会给"带扩展属性的文件"附一份 AppleDouble（`._名字`），
+  #     实测把 .DS_Store 全排除掉也照样落一地 `._*`；
+  #   · 不加 --no-xattrs，bsdtar 会把 xattr 写成 LIBARCHIVE.xattr.* 扩展头，Deck 的 GNU tar
+  #     认不出来，878M 的目录能刷出十几万行 "Ignoring unknown extended header keyword"。
+  # 用 -C 而不是先 cd，路径里有日文/空格也不用担心。
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$dir" -cf - \
+    --exclude='.DS_Store' --exclude='._*' --exclude='.Spotlight-V100' . \
+    | rsh "tar -xf - -C \"\$HOME/.local/share/deckkit/games/$slug/game\"" || die "拷贝失败"
+  ok "已拷贝（Deck 上 $(gctl size "$gdir")）"
+
+  hdr "准备 Proton 环境"
+  gctl prefix "$appid" >/dev/null || die "建 prefix 失败"
+  local proton; proton="$(deck_proton)"
+  [ -n "$proton" ] || die "Deck 上没有 Proton"
+  ok "Proton ${proton}（prefix 是空的：第一次启动时 Proton 自己初始化它）"
+
+  local gameexe=""
+  if [ -n "$exeopt" ]; then
+    case "$exeopt" in /*) gameexe="$exeopt" ;; *) gameexe="$gdir/$exeopt" ;; esac
+    rsh "test -f \"$gameexe\"" || die "Deck 上没有这个文件：$gameexe"
+  else
+    gameexe="$(gctl find-game-exe --dir "$gdir" | head -1)"
+    [ -n "$gameexe" ] || die "游戏目录里没找到主程序（.exe）—— 用 --exe <相对路径> 指定"
+  fi
+  ok "游戏主程序 $gameexe"
+  local gamedir; gamedir="$(dirname "$gameexe")"
+  write_launcher "$slug" "$appid" "$proton" "$gamedir" "$gameexe" "$name" || die "写启动脚本失败"
+
+  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" <<EOF
+name=$name
+slug=$slug
+appid=$appid
+proton=$proton
+prefix=$pfx
+launcher=$launcher
+game_exe=$gameexe
+game_dir=$gdir
+portable=1
+source_dir=$dir
+size=$(gctl size "$gdir")
+prefix_size=$(gctl size "$pfx")
+installed_at=$(date '+%Y-%m-%d %H:%M:%S')
+EOF
+  ok "记录已写入"
+  dim "  启动方式：${launcher}（不走 Steam 也能起）"
+  if [ "$noshortcut" = 1 ]; then
+    dim "  按 --no-shortcut 跳过 Steam 登记；要登记随时跑：deck games shortcut ${slug}"
+  else
+    hdr "登记进 Steam「非 Steam 游戏」"
+    if [ "$no_session" = 1 ]; then cmd_shortcut "$slug" --no-session; else cmd_shortcut "$slug"; fi \
+      || warn "自动登记失败，装完后手动跑：deck games shortcut ${slug}"
+    dim "  切回 Gaming 模式就能在库里看到它（steamosctl switch-to-game-mode，或自己切）"
+  fi
+}
+
+# 安装器跑完之后的收尾：前后 diff → 找主程序 → 写启动脚本 → 记录
+cmd_finish() {
+  local slug="${1:-}" appid="${2:-}" name="${3:-}" proton="${4:-}" rdir="${5:-}" exe="${6:-}"
+  [ -n "$slug" ] || die "用法：deck games finish <名字>"
+  if [ -z "$appid" ]; then
+    local want="$slug"; local r; r="$(resolve_slug "$slug")"
+    [ -n "$r" ] && slug="$r"
+  fi
+  require_deck
+
+  # 参数缺省时从 install 留下的 start.tsv 读
+  local sv; sv="$(rsh "cat \"\${HOME}/deckkit/services/games/store/$slug/start.tsv\" 2>/dev/null")"
+  [ -n "$appid" ] || appid="$(printf '%s\n' "$sv" | sed -n 's/^appid=//p')"
+  [ -n "$name" ] || name="$(printf '%s\n' "$sv" | sed -n 's/^name=//p')"
+  [ -n "$proton" ] || proton="$(printf '%s\n' "$sv" | sed -n 's/^proton=//p')"
+  [ -n "$rdir" ] || rdir="$(printf '%s\n' "$sv" | sed -n 's/^rdir=//p')"
+  [ -n "$exe" ] || exe="$(printf '%s\n' "$sv" | sed -n 's/^exe=//p')"
+  local started; started="$(printf '%s\n' "$sv" | sed -n 's/^started_epoch=//p')"
+  [ -n "$name" ] || { name="$slug"; }
+  [ -n "$proton" ] || proton="$(gctl protons | head -1)"
+
+  # 关键：Steam 给「安装器」这条快捷方式算的 appid 与我们的不同，
+  # 所以先认我们记的那个 prefix；不行就找「start.tsv 之后被动过、且装出了
+  # 非系统 exe」的 prefix —— 那个才是真正装着东西的。
+  local pfx="" id
+  if rsh "test -d \"\${HOME}/.steam/steam/steamapps/compatdata/$appid/pfx/drive_c\""; then
+    [ -n "$(gctl find-game-exe "$appid" | head -1)" ] && pfx="/home/deck/.steam/steam/steamapps/compatdata/$appid"
+  fi
+  if [ -z "$pfx" ]; then
+    [ -n "$started" ] || die "没有 start.tsv（先 deck games install '<exe>'），或手工指定：deck games finish <slug> <appid>"
+    dim "  我们记的 prefix 里没有游戏，去找「这次安装之后」被动过的 prefix…"
+    id="$(rsh "for p in \$(find ~/.steam/steam/steamapps/compatdata -mindepth 1 -maxdepth 1 -type d -newermt \"@$started\" 2>/dev/null | sort); do
+                 i=\$(basename \"\$p\")
+                 n=\$(find \"\$p/pfx/drive_c\" -maxdepth 4 -iname '*.exe' 2>/dev/null | grep -viE 'unins|setup|vc_redist|dxsetup|dotnet|crashpad' | wc -l)
+                 [ \"\$n\" -gt 0 ] && { echo \"\$i\"; break; }
+               done" | head -1)"
+    [ -n "$id" ] && pfx="/home/deck/.steam/steam/steamapps/compatdata/$id" && appid="$id"
+  fi
+  [ -n "$pfx" ] || die "找不到装着游戏的 prefix —— 安装没成功？先 deck games list / 上 Deck 看看"
+  ok "prefix $pfx"
+
+  gctl snapshot "$pfx" > /tmp/deckkit-games-after.tsv || true
+  local difft nnew nmod
+  difft="$(gctl diff /tmp/deckkit-games-before.tsv /tmp/deckkit-games-after.tsv 2>/dev/null || true)"
+  nnew="$(printf '%s\n' "$difft" | grep -c '^new' || true)"
+  nmod="$(printf '%s\n' "$difft" | grep -c '^mod' || true)"
+  hdr "安装结果"
+  ok "新增文件 ${nnew} 个 · 改动 ${nmod} 个 · prefix $(gctl size "$pfx")"
+  local gameexe; gameexe="$(gctl find-game-exe "$appid" | head -1)"
+  [ -n "$gameexe" ] || { bad "没找到游戏主程序"; return 1; }
+  ok "游戏主程序 $gameexe"
+  local gamedir; gamedir="$(dirname "$gameexe")"
+  local launcher; launcher="$(launcher_path "$slug")"
+  write_launcher "$slug" "$appid" "$proton" "$gamedir" "$gameexe" "$name" || die "写启动脚本失败"
+  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" <<EOF
+name=$name
+slug=$slug
+appid=$appid
+proton=$proton
+prefix=$pfx
+launcher=$launcher
+game_exe=$gameexe
+setup=$(basename "${exe:-setup.exe}")
+installed_at=$(date '+%Y-%m-%d %H:%M:%S')
+new_files=$nnew
+mod_files=$nmod
+prefix_size=$(gctl size "$pfx")
+EOF
+  ok "记录已写入"
+  dim "  启动方式：${launcher}（不走 Steam 也能起）"
+  dim "  想在 Steam 里也有一条游戏入口：deck games shortcut $slug"
+  drop_staging "$slug"
+}
+
+# 收尾后把暂存的安装包留着（用户自己保存的是原文件，这份是 Deck 上的副本）
+# —— 按配置决定删不删
+drop_staging() {
+  local slug="$1"
+  # 保险：只有确实写出了记录才删安装包副本
+  rsh "test -f \"\\\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" || return 0
+  local keep; keep="$(cfg_get KEEP_INSTALLER_ON_DECK)"; keep="${keep:-no}"
+  [ "$keep" = "yes" ] && return 0
+  rsh "rm -f \"\${HOME}/deckkit/services/games/store/$slug/setup.exe\"" 2>/dev/null
+  dim "  已删掉 Deck 上的安装包副本（按配置不留）"
+}
+
+cmd_shortcut() {
+  local slug="${1:-}" no_session=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in --no-session) no_session=1 ;; esac
+    shift
+  done
+  [ -n "$slug" ] || die "用法：deck games shortcut <名字> [--no-session]"
+  require_deck
+  local want="$slug"; slug="$(resolve_slug "$slug")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+  local f="$DECK_GAMES_ROOT/store/$slug/meta.tsv"
+  local name appid launcher proton gamedir
+  meta() { rsh "sed -n 's/^$1=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1; }
+  name="$(meta name)"; appid="$(meta appid)"; launcher="$(meta launcher)"; proton="$(meta proton)"
+  [ -n "$appid" ] || die "没有 $slug 的记录（先 deck games install）"
+  local startdir; startdir="$(dirname "$(meta game_exe)")"
+  hdr "登记 Steam 快捷方式"
+  ensure_session "$no_session"
+  # 文件丢了**或者被 Steam 清成 0 字节/损坏** → 先从备份恢复再写（实测踩过：Steam
+  # 退出时把它清空，0 字节的 live 文件会让解析直接失败）
+  # 同上：不自动翻备份（会把用户删掉的条目带回来）；文件不在/坏掉就当空列表写
+  if gctl shortcut-add "$appid" "$name" "$launcher" "$startdir" ""; then
+    # 回读确认：Steam 在桌面模式会自启，起来时会用它内存里的列表覆盖这个文件。
+    # 必须**按 appid** 查（shortcut-vdf.py --has 解析文件），不能用
+    # `strings … | grep 名字`：strings 只输出 ASCII 串，日文名字永远查不到，
+    # 于是"明明写进去了"却报回读不到（实测踩过，见 SERVICE.md 实测段）。
+    sleep 5
+    if gctl shortcut-has "$appid" >/dev/null 2>&1; then      # 退出码说话，不解析它的文案
+      ok "已写入，5 秒后再验仍在 ✓ —— 切回 Gaming Mode 就有它了"
+    else
+      warn "写进去了但回读不到 —— 多半是 Steam 启动时覆盖了它"
+      dim "  退出 Steam（桌面模式下它是自动启动的）再跑一次：deck games shortcut ${slug}"
+    fi
+    dim "  不用在桌面模式重启 Steam；也不用给它设「强制 Proton」："
+    dim "  run.sh 是 Linux 脚本，它自己会带好这个 prefix 和 Proton ${proton}"
+  else
+    warn "写入失败或文件解析不自洽 —— 先跑 deck games shortcut-check 看看"
+    return 1
+  fi
+}
+
+# 已装的游戏表：slug <TAB> 显示名
+games_table() {
+  rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do
+         s=$(basename "$d"); [ -f "$d/meta.tsv" ] || continue
+         n=$(sed -n "s/^name=//p" "$d/meta.tsv")
+         printf "%s\t%s\n" "$s" "$n"
+       done'
+}
+
+# 允许用显示名（deck games ls 里那个）或 slug；返回 slug
+resolve_slug() {
+  local q="${1:-}" table s ql
+  [ -n "$q" ] || return 1
+  ql="$(printf '%s' "$q" | tr 'A-Z' 'a-z')"
+  table="$(games_table)"
+  [ -n "$table" ] || return 1
+  s="$(printf '%s\n' "$table" | awk -F'\t' -v q="$q" '$1==q{print $1; exit}')"
+  if [ -z "$s" ]; then
+    s="$(printf '%s\n' "$table" | awk -F'\t' -v q="$ql" 'tolower($2)==q{print $1; exit}')"
+  fi
+  if [ -z "$s" ]; then
+    s="$(printf '%s\n' "$table" | awk -F'\t' -v q="$ql" 'index(tolower($1),q)==1{print $1; exit}')"
+  fi
+  [ -n "$s" ] && printf '%s' "$s"
+}
+
+cmd_uninstall() {
+  local slug="${1:-}" yes=0 with_shortcut=0
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1 ;;
+      --with-shortcut) with_shortcut=1 ;;
+    esac
+    shift
+  done
+  [ -n "$slug" ] || die "用法：deck games uninstall <名字> [--yes] [--with-shortcut]"
+  local want="$slug"
+  slug="$(resolve_slug "$slug")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+  require_deck
+  local appid; appid="$(rsh "sed -n 's/^appid=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1)"
+  [ -n "$appid" ] || die "没有 $slug 的记录"
+  local gdir sz
+  gdir="$(rsh "sed -n 's/^game_dir=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1)"
+  # 体积以记录里的 size 为准：免安装游戏的 prefix 是空的，只看 prefix 会误报成 0
+  sz="$(rsh "sed -n 's/^size=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1)"
+  [ -n "$sz" ] || sz="$(gctl size "/home/deck/.steam/steam/steamapps/compatdata/$appid")"
+  if [ "$yes" != 1 ]; then
+    [ -t 0 ] || die "uninstall 需要 --yes（非交互）"
+    local what="prefix compatdata/$appid"
+    [ -n "$gdir" ] && what="游戏目录 $gdir + prefix compatdata/$appid"
+    printf '  将删除 %s（%s）与启动脚本，记录一并删掉。输入 yes 继续：' "$what" "$sz"
+    local a=""; read -r a; [ "$a" = "yes" ] || die "已取消"
+  fi
+  gctl remove-prefix "$appid" || die "删除 prefix 失败"
+  rsh "rm -rf \"\$HOME/.local/share/deckkit/games/$slug\""
+  rsh "rm -f \"\$HOME/.local/share/applications/deckkit-$slug.desktop\""
+  command -v update-desktop-database >/dev/null 2>&1 && rsh 'command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1'
+    rsh "rm -rf \"\${HOME}/deckkit/services/games/store/$slug\""   # 记录一起删（已卸载的不留、不显示）
+  ok "已卸载 ${slug}（游戏本体 + 启动脚本 + 桌面菜单项 + 记录）"
+  # Steam 列表里的那条：默认让它自己在 Steam 界面删；--with-shortcut 时我们代劳（要求 Steam 没在跑）
+  if [ "$with_shortcut" = 1 ]; then
+    ensure_session
+    gctl shortcut-remove "$appid" "$slug" || warn "删 Steam 条目失败（可以跑 deck games shortcut-check 看细节）"
+  else
+    dim "  Steam 库里那条：右键 → 管理 → 从库中移除（Steam 自己处理最安全）"
+    dim "  或者退出 Steam 后：deck games uninstall $slug --with-shortcut --yes"
+  fi
+}
+
+cmd_list() {
+  require_deck
+  hdr "已安装（deckkit 管）"
+  local out
+  # 体积：免安装游戏是**游戏目录**的大小（prefix 几乎是空的），装 exe 的是 prefix 大小
+  out="$(rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do [ -f "$d/meta.tsv" ] || continue; n=$(sed -n "s/^name=//p" "$d/meta.tsv"); a=$(sed -n "s/^appid=//p" "$d/meta.tsv"); s=$(sed -n "s/^size=//p" "$d/meta.tsv"); [ -n "$s" ] || s=$(sed -n "s/^prefix_size=//p" "$d/meta.tsv"); t=$(sed -n "s/^installed_at=//p" "$d/meta.tsv"); printf "%s\t%s\t%s\t%s\n" "$n" "$a" "$s" "$t"; done' | grep -v '已卸载')"
+  if [ -z "$out" ]; then warn "还没有（deck games add <setup.exe|游戏目录>）"; return 0; fi
+  printf '  %-24s %-12s %-10s %s\n' "名字" "appid" "体积" "安装时间"
+  printf '%s\n' "$out" | while IFS=$'\t' read -r n a s t; do printf '  %-24s %-12s %-10s %s\n' "$n" "$a" "$s" "$t"; done
+}
+
+cmd_status() {
+  require_deck
+  local out; out="$(rsh 'ls -d "$HOME"/deckkit/services/games/store/*/ 2>/dev/null | wc -l')"
+  if [ "${out:-0}" = 0 ]; then
+    printf '%s!%s 还没有装过游戏（deck games add <setup.exe|游戏目录>）\n' "$C_YEL" "$C_RST"
+  else
+    printf '%s✓%s %s 个（deckkit 管的非 Steam 游戏）\n' "$C_GRN" "$C_RST" "$out"
+  fi
+  cmd_list
+  hdr "Deck 侧"
+  dim "  Proton：$(gctl protons | tr '\n' ' ')"
+  dim "  Steam：$(rsh 'pgrep -x steam >/dev/null && echo 运行中 || echo 没在跑')"
+}
+
+cmd_protons() { require_deck; hdr "Deck 上的 Proton"; gctl protons | sed 's/^/  /'; }
+cmd_install_here() {
+  require_deck
+  rsh "mkdir -p \"\${HOME}/deckkit/services/games/store\" \"\${HOME}/.local/share/deckkit/games\"" || die "建目录失败"
+  rsync -a "$DECK_DIR/gamectl.sh" "$DECK_SSH:$DECK_GAMES_ROOT/gamectl.sh" || die "上传 gamectl.sh 失败"
+  rsync -a "$DECK_DIR/shortcut-vdf.py" "$DECK_SSH:$DECK_GAMES_ROOT/shortcut-vdf.py" || die "上传 shortcut-vdf.py 失败"
+  rsync -a "$DECK_DIR/compat-tool.py" "$DECK_SSH:$DECK_GAMES_ROOT/compat-tool.py" || die "上传 compat-tool.py 失败"
+  rsh "chmod 755 \"\${HOME}/deckkit/services/games/gamectl.sh\" \"\${HOME}/deckkit/services/games/shortcut-vdf.py\" \"\${HOME}/deckkit/services/games/compat-tool.py\""
+  ok "Deck 侧就位（gamectl.sh + shortcut-vdf.py）"
+  ok "Proton：$(gctl protons | tr '\n' ' ')"
+  dim "  下一步：deck games add '<setup.exe|游戏目录>'"
+}
+# 补写/重写桌面菜单项（装完没看到图标时用）
+cmd_desktop() {
+  local slug="${1:-}"; [ -n "$slug" ] || die "用法：deck games desktop <名字>"
+  require_deck
+  local want="$slug"; slug="$(resolve_slug "$slug")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+  local f="$DECK_GAMES_ROOT/store/$slug/meta.tsv"
+  local meta; meta() { rsh "sed -n 's/^$1=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1; }
+  local name appid launcher
+  name="$(meta name)"; appid="$(meta appid)"; launcher="$(meta launcher)"
+  [ -n "$appid" ] || die "没有 $slug 的记录"
+  [ -n "$launcher" ] || launcher="$(launcher_path "$slug")"
+  gctl desktop "$slug" "$name" "$launcher" "$appid"
+}
+
+# 只把 Steam 列表里那条移除（不删游戏）
+cmd_shortcut_remove() {
+  local slug="${1:-}"; [ -n "$slug" ] || die "用法：deck games shortcut-remove <slug>"
+  require_deck
+  local appid; appid="$(rsh "sed -n 's/^appid=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1)"
+  [ -n "$appid" ] || die "没有 $slug 的记录"
+  hdr "从 Steam 列表移除"
+  ensure_session
+  gctl shortcut-remove "$appid" "$slug" || die "删除失败（deck games shortcut-check 看细节）"
+  dim "  游戏本体没动；要连本体一起删：deck games uninstall $slug --yes"
+}
+
+# 极简卸载：Steam 条目 + 游戏本体一次清掉（ollama 风格，不要一长串后缀）
+cmd_rm() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || die "用法：deck games rm <名字>   （deck games 看有哪些）"
+  cmd_uninstall "$slug" --yes --with-shortcut
+}
+
+# 清掉残留的"已卸载"记录（老版本会留）
+cmd_clean() {
+  require_deck
+  local n; n="$(rsh 'grep -rl "已卸载" "$HOME"/deckkit/services/games/store/*/meta.tsv 2>/dev/null | wc -l')"
+  [ "$n" = 0 ] && { ok "没有残留记录"; return 0; }
+  rsh 'for f in "$HOME"/deckkit/services/games/store/*/meta.tsv; do grep -q "已卸载" "$f" 2>/dev/null && rm -rf "$(dirname "$f")"; done'
+  ok "清掉 ${n} 条残留记录"
+}
+
+cmd_help() {
+  cat <<'EOF'
+    deck games              已装的游戏
+    deck games add <exe>    装（自动切桌面模式、杀 Steam、装完收尾）
+    deck games add <目录|主程序>  免安装游戏（整份拷到 Deck，挑主程序，登记 Steam）
+    deck games rm <名字>     卸载（Steam 列表条目 + 游戏本体一起清）
+EOF
+  dim "  其它：deck games shortcut <名字> 只登记 Steam 条目 / protons / verify；全部：deck games help-all"
+}
+cmd_help_all() { sed -n '2,30p' "$0" | sed 's/^# \?//'; }
+
+cmd_shortcut_check() { require_deck; hdr "shortcuts.vdf 无损性自检"; gctl shortcut-check; }
+cmd_shortcut_restore() {
+  require_deck; hdr "从备份合并 shortcuts.vdf"
+  warn "这是**合并**：你以前删掉的条目也会被带回来（想删就用 Steam 界面再删一次）"
+  ensure_session            # 它要写 shortcuts.vdf：Steam 在跑就会被覆盖
+  gctl shortcut-restore
+}
+
+cmd_caps() { printf 'pick 选择游戏安装包（setup.exe）或免安装游戏的主程序（game.exe）—— 自动判断\tinstall\t*\n'; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \?//'; }
+
+case "${1:-status}" in
+  status|st)      shift; cmd_status ;;
+  list|ls)        shift; cmd_list ;;
+  install)        shift; cmd_install "$@" ;;
+  shortcut)       shift; cmd_shortcut "$@" ;;
+  desktop)        shift; cmd_desktop "$@" ;;
+  finish)         shift; cmd_finish "$@" ;;
+  ""|ls|list)      cmd_list ;;
+  add)            shift; cmd_install "$@" ;;      # 简写：deck games add <exe>
+  rm|del|remove)  shift; cmd_rm "$@" ;;           # 简写：deck games rm <名字>（条目+本体一起删）
+  clean)          cmd_clean ;;                    # 清掉残留的"已卸载"记录
+  help|--help|-h) cmd_help ;;
+  help-all)       cmd_help_all ;;
+  shortcut-check) cmd_shortcut_check ;;
+  shortcut-remove) shift; cmd_shortcut_remove "$@" ;;
+  shortcut-restore) cmd_shortcut_restore ;;
+  uninstall|rm)   shift; cmd_uninstall "$@" ;;
+  protons)        cmd_protons ;;
+  install-here)   cmd_install_here ;;
+  caps)           cmd_caps ;;
+  -h|--help|help|"") usage ;;
+  *) die "games 不认识的子命令：$1" ;;
+esac

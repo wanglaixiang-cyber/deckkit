@@ -878,28 +878,34 @@ cmd_clean() {
 }
 
 # ─────────────────────── 交互式游戏管理（TUI）───────────────────────
-# 菜单栏那条「游戏管理」走的就是它：**方向键选、回车卸载**，不用记命令。
-# 三条硬规矩（都踩过）：
-#   ① draw() 里**不许有 I/O** —— 一开始每次重画都去跑 `deck brief`（4 个服务 = 4 次 ssh，
-#      好几秒），期间终端 echo 开着，用户按的键被打印成 `^[[A` 又排进输入队列，
-#      每个字节再触发一次重画 → 看起来就是"疯狂刷新、没法交互"。
-#   ② 整个界面期间 `stty -echo`（问 y/N 时临时打开），否则按键会回显到屏幕上。
-#   ③ 方向键要同时认 `ESC[A` 和 `ESC OA`（DECCKM：有些终端/前一个程序会留在应用模式）。
-# 顶部只放一份精简服务状态（`deck brief`，进入和按 r 时各取一次）；完整状态：deck status。
+# 像 htop/vim 那样：**备用屏**里画定长画面，退出后终端恢复原样（不会把一帧帧
+# 列表堆进 scrollback，也不会因为行数超过终端高度而往下滚）。方向键选、回车卸载。
+# 几条硬规矩（都踩过）：
+#   ① draw 里**不许有 I/O**：一开始每次重画都跑 `deck brief`（4 次 ssh 约 10 秒），
+#      期间 echo 开着 → 按键被回显成 ^[[A 又排进队列 → 每字节再触发一次重画 = "疯狂刷新"。
+#   ② 全程 `stty -echo`（问 y/N 与退出命令输出时临时打开）。
+#   ③ 方向键同时认 `ESC[A` 与 `ESC OA`（DECCKM）。
+#   ④ 画面必须**装得下**：列表超长就开窗口分页（多余项用 ↑/↓ 提示），否则会滚屏。
+#   ⑤ 跑外部命令（卸载/封面/维修）时先退出备用屏，命令输出留在正常屏幕里可回看。
 cmd_tui() {
   if [ ! -t 0 ] || [ ! -t 1 ]; then cmd_list; return 0; fi
   local ROOT; ROOT="$(cd "$SVC_DIR/../.." && pwd)"     # 框架根：$SVC_DIR 是 <root>/services/games
-  local slugs=() names=() sizes=() sel=0 key rest ans i brief="" echo_off=0
+  local slugs=() names=() sizes=() sel=0 key rest ans brief="" echo_off=0
+  local ALT_ON ALT_OFF CIVIS CNORM
+  ALT_ON="$(tput smcup 2>/dev/null)";  [ -n "$ALT_ON" ]  || ALT_ON=$'\033[?1049h'
+  ALT_OFF="$(tput rmcup 2>/dev/null)"; [ -n "$ALT_OFF" ] || ALT_OFF=$'\033[?1049l'
+  CIVIS="$(tput civis 2>/dev/null)";   [ -n "$CIVIS" ]   || CIVIS=$'\033[?25l'
+  CNORM="$(tput cnorm 2>/dev/null)";   [ -n "$CNORM" ]   || CNORM=$'\033[?25h'
 
-  tui_restore() {
-    printf '\033[?25h\033[0m'
-    [ "$echo_off" = 1 ] && stty echo 2>/dev/null
-    echo_off=0
-  }
+  tui_echo_on()  { [ "$echo_off" = 1 ] && { stty echo 2>/dev/null; echo_off=0; }; }
+  tui_echo_off() { [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }; }
+  tui_enter() { printf '%s%s' "$ALT_ON" "$CIVIS"; tui_echo_off; }
+  tui_leave() { tui_echo_on; printf '%s%s\033[0m' "$CNORM" "$ALT_OFF"; }
+  tui_restore() { tui_leave; }
 
-  load_list() {   # 唯一做 I/O 的地方：列表 + 精简状态（进入/操作后/按 r）
+  load_list() {   # 唯一做 I/O 的地方：列表 + 精简状态（进入 / 操作后 / 按 r）
     slugs=(); names=(); sizes=()
-    local line slug name size
+    local slug name size
     while IFS=$'\t' read -r slug name size; do
       [ -n "$slug" ] || continue
       slugs+=("$slug"); names+=("$name"); sizes+=("$size")
@@ -915,54 +921,113 @@ cmd_tui() {
     return 0
   }
 
-  draw() {        # 纯渲染：不跑命令、不联网（否则按键就会"疯狂刷新"）
-    printf '\033[H\033[2J'
-    printf '%s  deckkit · 游戏管理%s\n' "$C_B" "$C_RST"
-    printf '%s\n' "───────────────────────────────────────────────"
-    [ -n "$brief" ] && printf '%s\n' "$brief" | sed 's/^/  /'
-    printf '%s\n' "───────────────────────────────────────────────"
-    if [ "${#slugs[@]}" = 0 ]; then
-      printf '  （还没有装过游戏）\n'
-    else
-      local idx=0 name size
-      while [ "$idx" -lt "${#slugs[@]}" ]; do
-        name="${names[$idx]}"; size="${sizes[$idx]}"
-        [ ${#name} -gt 30 ] && name="$(printf '%s' "$name" | cut -c1-29)…"
-        if [ "$idx" = "$sel" ]; then
-          printf '\033[7m  ▶ %-32s %8s \033[0m\n' "$name" "$size"
-        else
-          printf '    %-32s %8s\n' "$name" "$size"
-        fi
-        idx=$((idx + 1))
-      done
-    fi
-    printf '%s\n' "───────────────────────────────────────────────"
-    printf '%s\n' "  ↑/↓ 选择 · 回车 卸载 · c 重做封面 · f 维修 · r 刷新 · q 退出"
-    printf '%s\n' "  完整状态：deck status   只列游戏：deck games ls"
+  # 按**字符**截断/补空格：bash 的 ${s:0:n} 在多字节 locale 下按字符算，
+  # 千万别用 printf '%.*s'（它按字节截，会把中文切成半个字 → 终端里花屏）
+  # 终端尺寸：先问 stty（不依赖 TERM=），再退回 tput —— 实测 TERM=dumb 时
+  # `tput lines` 会给 terminfo 里的 24，而不是真实高度，画面就会算错、装不下、滚屏。
+  tui_size() {
+    local sz; sz="$(stty size 2>/dev/null)"
+    LINES="${sz%% *}"; COLS="${sz##* }"
+    case "$LINES" in ''|*[!0-9]*) LINES="$(tput lines 2>/dev/null)" ;; esac
+    case "$COLS"  in ''|*[!0-9]*) COLS="$(tput cols 2>/dev/null)" ;; esac
+    case "$LINES" in ''|*[!0-9]*) LINES=24 ;; esac
+    case "$COLS"  in ''|*[!0-9]*) COLS=80 ;; esac
   }
 
-  do_action() {   # 把界面让开，跑一条命令，再回来
+  tui_cut() { local n="${1:-0}" s="${2:-}"; if [ "${#s}" -gt "$n" ]; then printf '%s…' "${s:0:$((n - 1))}"; else printf '%s' "$s"; fi; }
+  # 注意：别写 `local n="$1" s="$2" w=${#s}` —— 同一个 local 里引用刚声明的 s，
+  # bash 3.2 下会偶发报 "s: unbound variable"（set -u 直接把整屏画到一半就中断）。
+  tui_pad() {
+    local n="${1:-0}" s="${2:-}"
+    printf '%s' "$s"
+    n=$(( n - ${#s} ))
+    while [ "$n" -gt 0 ]; do printf ' '; n=$(( n - 1 )); done
+  }
+
+  draw() {        # 纯渲染：一次 printf 出整屏（不跑命令、不联网、不分多次写 → 不闪不滚）
+    local LINES COLS buf="" nbrief=0 list_h total start end i name size row
+    tui_size
+    [ "$LINES" -lt 8 ] && LINES=8
+    [ "$COLS" -lt 30 ] && COLS=30
+    # 宽度按"一个字符最坏占 2 列"保守估，宁可早截断也不折行（折行就会滚屏）
+    local lim=$(( (COLS - 3) * 5 / 8 )); [ "$lim" -lt 8 ] && lim=8
+    [ -n "$brief" ] && nbrief="$(printf '%s\n' "$brief" | wc -l | tr -d ' ')"
+    list_h=$(( LINES - (nbrief + 3) - 2 - 1 ))     # 末尾留一行余量，别顶到屏幕底
+    [ "$list_h" -lt 1 ] && list_h=1
+    total="${#slugs[@]}"
+    local name_w=$(( lim - 9 )); [ "$name_w" -lt 6 ] && name_w=6
+
+    buf="${C_B}  deckkit · 游戏管理${C_RST}"$'\033[K\n'
+    buf+="$(tui_cut "$COLS" "───────────────────────────────────────────────")"$'\033[K\n'
+    if [ -n "$brief" ]; then
+      while IFS= read -r row; do
+        buf+="  $(tui_cut "$lim" "$row")"$'\033[K\n'
+      done <<< "$brief"
+    fi
+    buf+="$(tui_cut "$COLS" "───────────────────────────────────────────────")"$'\033[K\n'
+
+    if [ "$total" = 0 ]; then
+      buf+="  （还没有装过游戏）"$'\033[K\n'
+    else
+      start=0; end="$total"
+      if [ "$total" -gt "$list_h" ]; then
+        start=$(( sel - (list_h - 1) / 2 )); [ "$start" -lt 0 ] && start=0
+        end=$(( start + list_h ))
+        [ "$end" -gt "$total" ] && { end="$total"; start=$(( end - list_h )); }
+        [ "$start" -lt 0 ] && start=0
+        # 有"上面还有"提示行时，列表少显示一行
+        [ "$start" -gt 0 ] && [ $(( end - start + 1 )) -gt "$list_h" ] && end=$(( end - 1 ))
+      fi
+      if [ "$start" -gt 0 ]; then
+        buf+="  ${C_DIM}↑ 上面还有 $start 项${C_RST}"$'\033[K\n'
+      fi
+      i="$start"
+      while [ "$i" -lt "$end" ]; do
+        name="$(tui_cut "$name_w" "${names[$i]}")"; size="${sizes[$i]}"
+        if [ "$i" = "$sel" ]; then
+          buf+=$'\033[7m'"  ▶ $(tui_pad "$name_w" "$name") ${C_RST}"$'\033[7m'"$(tui_pad 8 "$size")"$'\033[0m'$'\033[K\n'
+        else
+          buf+="    $(tui_pad "$name_w" "$name") $(tui_pad 8 "$size")"$'\033[K\n'
+        fi
+        i=$(( i + 1 ))
+      done
+      if [ "$end" -lt "$total" ]; then
+        buf+="  ${C_DIM}↓ 下面还有 $(( total - end )) 项${C_RST}"$'\033[K\n'
+      fi
+    fi
+
+    buf+="$(tui_cut "$COLS" "───────────────────────────────────────────────")"$'\033[K\n'
+    local hint="↑/↓ 选择 · 回车 卸载 · c 重做封面 · f 维修 · r 刷新 · q 退出"
+    [ "$COLS" -lt 76 ] && hint="↑/↓ 选择 · 回车 卸载 · q 退出"
+    buf+="  $(tui_cut "$lim" "$hint")"$'\033[K'
+    buf+=$'\033[J\033[H'                        # 清掉残余 + 光标回左上
+    printf '%s' "$buf"
+  }
+
+  prompt_line() {   # 在底部提示行上原地写提示（不占新行 → 不会滚屏）
+    local LINES COLS; tui_size
+    printf '\033[%d;1H\033[K  %s' "$LINES" "$(tui_cut "$(( COLS - 4 ))" "$1")"
+  }
+
+  suspend_run() {   # 退出备用屏跑一条命令（输出留在正常屏幕里），回车后回来
     local slug="$1"; shift
-    tui_restore
+    tui_leave
     printf '\n'
     "$@" || warn "这条命令失败了"
     printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
     IFS= read -r ans
-    printf '\033[?25l'
-    [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }
+    tui_enter
+    printf '\033[H\033[2J'
     load_list
   }
 
   trap 'tui_restore; exit 0' INT TERM
-  [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }
-  printf '\033[?25l'
-  # 先立刻出一帧，别让用户对着空屏等（状态和列表要几秒）
+  tui_enter
   printf '\033[H\033[2J  %sdeckkit · 游戏管理%s\n\n  %s正在读取服务状态和游戏列表…%s\n' "$C_B" "$C_RST" "$C_DIM" "$C_RST"
   load_list
   local last_sel=-1
   while :; do
     [ "$sel" != "$last_sel" ] && { draw; last_sel="$sel"; }
-    [ "${#slugs[@]}" = 0 ] && [ "$last_sel" = -2 ] || true
     IFS= read -rsn1 key || break
     if [ "$key" = $'\033' ]; then
       IFS= read -rsn2 -t 1 rest || rest=""
@@ -975,29 +1040,21 @@ cmd_tui() {
         sel=$(( sel < ${#slugs[@]} - 1 ? sel + 1 : 0 )) ;;
       ''|$'\n'|$'\r')
         [ "${#slugs[@]}" = 0 ] && continue
-        tui_restore
-        printf '\n  卸载 %s%s%s（游戏本体 + Steam 条目 + 封面，不可恢复）\n' "$C_B" "${names[$sel]}" "$C_RST"
-        printf '  注：会顺带退出 Steam（要写 shortcuts.vdf），需要的话还会切到桌面模式。\n'
-        printf '  确认卸载？[y/N] '
+        tui_echo_on
+        prompt_line "卸载「${names[$sel]}」（本体 + Steam 条目 + 封面，不可恢复；会退出 Steam）？[y/N] "
         IFS= read -r ans
+        tui_echo_off
         if [ "$ans" = y ] || [ "$ans" = Y ]; then
-          cmd_uninstall "${slugs[$sel]}" --yes --with-shortcut
-          printf '\n  %s按回车回到列表%s' "$C_DIM" "$C_RST"
-          IFS= read -r ans
-        else
-          printf '  已取消'
+          suspend_run "${slugs[$sel]}" cmd_uninstall --yes --with-shortcut "${slugs[$sel]}"
         fi
-        printf '\033[?25l'
-        [ -t 0 ] && { stty -echo 2>/dev/null; echo_off=1; }
-        load_list
         last_sel=-1 ;;
       c)
         [ "${#slugs[@]}" = 0 ] && continue
-        do_action "${slugs[$sel]}" cmd_cover "${slugs[$sel]}"
+        suspend_run "${slugs[$sel]}" cmd_cover "${slugs[$sel]}"
         last_sel=-1 ;;
       f)
         [ "${#slugs[@]}" = 0 ] && continue
-        do_action "${slugs[$sel]}" cmd_fix "${slugs[$sel]}"
+        suspend_run "${slugs[$sel]}" cmd_fix "${slugs[$sel]}"
         last_sel=-1 ;;
       r) load_list; last_sel=-1 ;;
       q|Q) break ;;

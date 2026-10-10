@@ -188,6 +188,7 @@ deck games add '<setup.exe>'          # 装安装包：切桌面模式 + 退 Ste
 deck games add '~/Desktop/游戏目录'    # 免安装游戏：整份拷过去 → 挑主程序 → 收尾
 deck games add '.../游戏目录/game.exe' # 同上，直接点主程序也行（是安装包还是绿色版由服务判断）
 deck games cover 'all'                 # 给库里的游戏生成封面：用 exe 自带的图标 + 标题（装完自动做）
+deck games fix '<名字>'                # 点开始没反应？重挑主程序 + 挪开游戏自带的 Windows 版 DXVK
 deck games shortcut <名字>             # 补登记（装完会自动登记）
 deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体（目录/prefix），一次清掉
 ```

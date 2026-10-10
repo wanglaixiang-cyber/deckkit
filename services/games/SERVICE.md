@@ -111,6 +111,24 @@ deck games cover <名字> --reicon        # 丢掉缓存的图标，重新从 ex
   `deck games rm` 会把封面、备份、缓存的图标和标记一起清掉。
 - **Steam 正在跑的话，要重启 Steam（或切一次 Gaming/桌面模式）才看得到新封面。**
 
+## 点开始没反应？先跑 `deck games fix`
+
+实测两个坑，都是"Steam 里点了开始，什么都没发生"，`fix` 一次收拾：
+
+| 坑 | 症状 / 证据 | fix 做什么 |
+|---|---|---|
+| **主程序挑错了**：`find-game-exe` 按"最大的 exe"挑，而 Unity 游戏目录里的 `UnityCrashHandler32.exe`（923KB）比真主程序（640KB）还大 | 启动的是崩溃处理器 → 点开始**彻底没反应**（进程一闪而过） | 排除表加了 `crashhandler / crashreport / steamerrorreporter` 等；`fix` 重挑并重写 `run.sh` + `meta.tsv` |
+| **repack 自带 Windows 版 DXVK**：游戏目录里的 `d3d11.dll`（2.6MB，配 `ShaderFixes/`） | Wine 的 dll 搜索顺序是"程序目录优先" → 这份 Windows dll 被加载 → Proton 下必崩（`Player.log`：`GfxDevice: creating device client` 之后 `Crash!!!` + 访问违例） | 把 `d3d11/dxgi/d3d10core/d3d12/d3d9.dll` 里 **>200KB 的**改名成 `<名字>.deckkit-off`（可逆），让 Proton 自带 DXVK 接管 |
+
+```bash
+deck games fix <名字>              # 也支持 all
+deck games fix <名字> --exe 子目录/主程序.exe   # 自己指定主程序
+```
+
+- **`WINEDLLOVERRIDES=d3d11=b` 没用** —— Proton 会自己重写这个环境变量（实测），所以只能挪文件。
+- 挪开的是文件、不是删除；想改回来把 `.deckkit-off` 后缀去掉即可。
+- 主程序变了的话，图标/封面会**自动重做**（`--no-cover` 跳过）。
+
 ## 已知边界
 
 - **Deck 要在桌面模式**才能看到安装向导 —— 服务会自动切过去，不用你手动切。

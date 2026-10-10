@@ -128,7 +128,7 @@ cmd_diff() {
 # 挑主程序时排除的东西：卸载器/安装器/运行库/Steam 自身。
 # 注意 `drive_c/Program Files[^/]*/Steam/` **不能**简写成 `/Steam/`：每个 prefix 的
 # 路径里都含 ~/.steam/steam/steamapps/…，那样写会把所有 exe 滤光（踩过）。
-EXE_EXCLUDE='unins|setup|install|vc_redist|dxsetup|dotnet|crashpad|launcher_installer|steam\.exe|drive_c/Program Files[^/]*/Steam/|steamwebhelper|winedevice'
+EXE_EXCLUDE='unins|setup|install|vc_redist|dxsetup|dotnet|crashpad|crashhandler|crashreport|launcher_installer|steamerrorreporter|steam\.exe|drive_c/Program Files[^/]*/Steam/|steamwebhelper|winedevice'
 
 # 在一棵目录树里挑主程序：排除上面那些，取最大的 exe
 pick_exe() {   # <根目录> [最大深度]

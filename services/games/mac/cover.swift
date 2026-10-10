@@ -8,32 +8,62 @@
 //
 //  用法：
 //    swift cover.swift --name "<游戏名>" --out <竖版.png> [--header <横版.jpg>]
-//                      [--image <底图>] [--subtitle "<小字>"]
+//                      [--icon <exe 里抠出来的图标.png>]   # 渐变按图标主色上色 + 居中放这枚图标
+//                      [--icon-fill]                      # 改成把图标铺满整张
+//                      [--image <底图>]                    # 用别的图铺满
+//                      [--subtitle "<小字>"]
 //
-//  没给 --image 就画一张排版封面（深色渐变 + 标题 + Steam Deck 标记）——
-//  不依赖任何素材，游戏目录里没有像样的图时也不会翻车。
+//  没有图时退回纯排版封面（中性深色渐变 + 标题）。
 // ============================================================
 import AppKit
 
 // ── 参数 ──
 var args: [String: String] = [:]
-var i = 1
+var flags = Set<String>()
 let argv = CommandLine.arguments
+var i = 1
 while i < argv.count {
     let k = argv[i]
     if k.hasPrefix("--") {
-        let v = (i + 1 < argv.count && !argv[i + 1].hasPrefix("--")) ? argv[i + 1] : ""
-        args[String(k.dropFirst(2))] = v
-        i += v.isEmpty ? 1 : 2
+        let key = String(k.dropFirst(2))
+        if i + 1 < argv.count && !argv[i + 1].hasPrefix("--") {
+            args[key] = argv[i + 1]
+            i += 2
+        } else {
+            flags.insert(key)
+            i += 1
+        }
     } else { i += 1 }
 }
 guard let name = args["name"], let outPath = args["out"] else {
-    FileHandle.standardError.write("用法：cover.swift --name <游戏名> --out <png> [--header <jpg>] [--image <底图>] [--subtitle <小字>]\n".data(using: .utf8)!)
+    FileHandle.standardError.write("用法：cover.swift --name <游戏名> --out <png> [--header <jpg>] [--icon <png>] [--icon-fill] [--image <底图>] [--subtitle <小字>]\n".data(using: .utf8)!)
     exit(2)
 }
 let headerPath = args["header"]
+let iconPath = args["icon"]
 let imagePath = args["image"]
+let iconFill = flags.contains("icon-fill")
 let subtitle = args["subtitle"] ?? ""
+
+// 底图/图标三选一：--image 铺满 > --icon-fill 铺满（用图标）> --icon 居中放图标
+struct Look {
+    var fill: String? = nil        // 铺满整张的图
+    var icon: String? = nil        // 居中放的那枚图标
+    var tintFrom: String? = nil    // 渐变取色来源
+}
+var look = Look()
+if let img = imagePath, !img.isEmpty {
+    look.fill = img
+} else if let ic = iconPath, !ic.isEmpty {
+    if iconFill {
+        look.fill = ic
+    } else {
+        look.icon = ic
+        look.tintFrom = ic
+    }
+}
+let hasFill = !(look.fill ?? "").isEmpty
+let hasIcon = !(look.icon ?? "").isEmpty
 
 // ── Steam Deck 官方 logo 的机身标记（和菜单栏那个同一段路径）──
 func deckMarkPath() -> CGPath {
@@ -60,7 +90,6 @@ func deckMarkPath() -> CGPath {
 }
 let MARK_W: CGFloat = 37.0385, MARK_H: CGFloat = 49.3856
 
-/// 把 logo 标记画到 (x, y)，高度为 h（AppKit 坐标：y 向上）
 func drawMark(_ ctx: CGContext, x: CGFloat, y: CGFloat, height: CGFloat, alpha: CGFloat) {
     let s = height / MARK_H
     ctx.saveGState()
@@ -72,31 +101,28 @@ func drawMark(_ ctx: CGContext, x: CGFloat, y: CGFloat, height: CGFloat, alpha: 
     ctx.restoreGState()
 }
 
-/// 底图：按「填满裁切」的方式画进去（不变形），再压一层从上到下变深的遮罩
-func drawPhoto(_ ctx: CGContext, path: String, size: NSSize, scrim: CGFloat, overall: CGFloat) {
+/// 铺满：按「填满裁切」的方式画（不变形），再压一层整体变暗 + 底部渐隐
+func drawFill(_ ctx: CGContext, path: String, size: NSSize, overall: CGFloat, scrim: CGFloat) {
     guard let img = NSImage(contentsOfFile: path),
           let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
     let iw = CGFloat(cg.width), ih = CGFloat(cg.height)
     let scale = max(size.width / iw, size.height / ih)
     let dw = iw * scale, dh = ih * scale
-    ctx.saveGState()
-    // 截图式的居中裁切（游戏截图/立绘都能用）
     let srcW = size.width / scale, srcH = size.height / scale
     let src = CGRect(x: (iw - srcW) / 2, y: (ih - srcH) / 2, width: srcW, height: srcH)
     if let crop = cg.cropping(to: src) {
-        ctx.draw(crop, in: CGRect(x: (size.width - dw) / 2, y: (size.height - dh) / 2, width: dw, height: dh))
+        ctx.draw(crop, in: CGRect(x: (size.width - dw) / 2, y: (size.height - dh) / 2,
+                                 width: dw, height: dh))
     }
-    ctx.restoreGState()
-    // 整张先压一层（亮底图/截图直接用会看不清字）
     if overall > 0 {
         ctx.setFillColor(NSColor.black.withAlphaComponent(overall).cgColor)
         ctx.fill(CGRect(origin: .zero, size: size))
     }
-    // 再从 15% 高度往下渐隐到几乎全黑 —— 标题就压在这层里
     if scrim > 0 {
         let colors = [NSColor.black.withAlphaComponent(0).cgColor,
                       NSColor.black.withAlphaComponent(scrim).cgColor] as CFArray
-        if let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.15, 1.0]) {
+        if let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors,
+                              locations: [0.15, 1.0]) {
             ctx.saveGState()
             ctx.addRect(CGRect(origin: .zero, size: size))
             ctx.clip()
@@ -107,27 +133,66 @@ func drawPhoto(_ ctx: CGContext, path: String, size: NSSize, scrim: CGFloat, ove
     }
 }
 
-/// 渐变底：深色斜向 + 一点点蓝，和 App 图标一个调子
-func drawGradient(_ ctx: CGContext, size: NSSize) {
-    let top = NSColor(calibratedRed: 0.16, green: 0.19, blue: 0.24, alpha: 1).cgColor
-    let bottom = NSColor(calibratedRed: 0.05, green: 0.06, blue: 0.08, alpha: 1).cgColor
+/// 图标的「主色」：缩到 1×1 取平均（先铺黑底，免得透明区让颜色偏淡）
+func averageColor(_ path: String) -> NSColor? {
+    guard let img = NSImage(contentsOfFile: path),
+          let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1, pixelsHigh: 1,
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                     isPlanar: false, colorSpaceName: .deviceRGB,
+                                     bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSColor.black.setFill()
+    NSRect(x: 0, y: 0, width: 1, height: 1).fill()
+    img.draw(in: NSRect(x: 0, y: 0, width: 1, height: 1), from: .zero,
+             operation: .sourceOver, fraction: 1)
+    NSGraphicsContext.restoreGraphicsState()
+    return rep.colorAt(x: 0, y: 0)
+}
+
+/// 背景渐变：中性深色；给了图标就按图标主色上色（不要那种纯灰）
+func drawGradient(_ ctx: CGContext, size: NSSize, tintFrom: String?) {
+    var top = NSColor(calibratedRed: 0.16, green: 0.19, blue: 0.24, alpha: 1)
+    var bottom = NSColor(calibratedRed: 0.05, green: 0.06, blue: 0.08, alpha: 1)
+    if let p = tintFrom, let c = averageColor(p) {
+        let h = c.hueComponent
+        let s = min(1.0, max(0.30, c.saturationComponent * 1.7))
+        let b = max(0.20, min(0.52, c.brightnessComponent * 0.95))
+        top = NSColor(calibratedHue: h, saturation: s * 0.85, brightness: b, alpha: 1)
+        bottom = NSColor(calibratedHue: h, saturation: s, brightness: 0.07, alpha: 1)
+    }
     if let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                          colors: [top, bottom] as CFArray, locations: [0, 1]) {
+                          colors: [top.cgColor, bottom.cgColor] as CFArray, locations: [0, 1]) {
         ctx.drawLinearGradient(g, start: CGPoint(x: 0, y: size.height),
                                end: CGPoint(x: size.width, y: 0), options: [])
     }
-    // 右上角一枚很淡的高光，避免整块死黑
     if let g2 = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
                            colors: [NSColor.white.withAlphaComponent(0.10).cgColor,
                                     NSColor.white.withAlphaComponent(0).cgColor] as CFArray,
                            locations: [0, 1]) {
-        ctx.drawRadialGradient(g2, startCenter: CGPoint(x: size.width * 0.85, y: size.height * 0.9),
-                               startRadius: 0, endCenter: CGPoint(x: size.width * 0.85, y: size.height * 0.9),
-                               endRadius: size.width * 0.75, options: [])
+        ctx.drawRadialGradient(g2, startCenter: CGPoint(x: size.width * 0.5, y: size.height * 0.72),
+                               startRadius: 0,
+                               endCenter: CGPoint(x: size.width * 0.5, y: size.height * 0.72),
+                               endRadius: size.width * 0.8, options: [])
     }
 }
 
-/// 这个字号下标题要几行 / 多高
+/// 把图标居中放上去（带一点投影）；边长按源图算 —— 64px 的小图标不硬拉大
+func drawIcon(_ ctx: CGContext, path: String, center: CGPoint, maxSide: CGFloat) {
+    guard let img = NSImage(contentsOfFile: path),
+          let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+    let src = CGFloat(max(cg.width, cg.height))
+    let side = min(maxSide, max(170, src * 1.8))
+    let rect = CGRect(x: center.x - side / 2, y: center.y - side / 2, width: side, height: side)
+    ctx.saveGState()
+    ctx.setShadow(offset: CGSize(width: 0, height: -8), blur: 28,
+                  color: NSColor.black.withAlphaComponent(0.55).cgColor)
+    ctx.interpolationQuality = .high
+    ctx.draw(cg, in: rect)
+    ctx.restoreGState()
+}
+
+// ── 标题排版 ──
 func measure(_ text: String, font: NSFont, width: CGFloat) -> (lines: Int, height: CGFloat) {
     let para = NSMutableParagraphStyle()
     para.lineBreakMode = .byWordWrapping
@@ -139,11 +204,7 @@ func measure(_ text: String, font: NSFont, width: CGFloat) -> (lines: Int, heigh
     return (max(1, Int((r.height / lh).rounded())), r.height)
 }
 
-/// 标题排版，两类名字要分开伺候：
-///   ① 短名字（OpenTTD）：**一行**，尽量大 —— 否则会断成「OpenT / TD」那种
-///   ② 长名字（中文长标题）：一行会小到看不清，那就折行，取"塞得进框且不超过
-///      maxLines"的最大字号
-/// 判据就是「一行能做到多大」：够大（≥ oneLineMin）就用一行，否则折行。
+/// 短名字保持一行尽量大；长名字折行取「塞得进框」的最大字号
 func fitFontSize(_ text: String, font: (CGFloat) -> NSFont, box: NSSize, maxLines: Int,
                  min: CGFloat = 16, max: CGFloat = 140, oneLineMin: CGFloat = 34) -> CGFloat {
     var size = max
@@ -164,7 +225,7 @@ func fitFontSize(_ text: String, font: (CGFloat) -> NSFont, box: NSSize, maxLine
     return min
 }
 
-func drawTitle(_ ctx: CGContext, text: String, box: CGRect, size: CGFloat, align: NSTextAlignment) {
+func drawTitle(_ text: String, box: CGRect, size: CGFloat, align: NSTextAlignment) {
     let para = NSMutableParagraphStyle()
     para.alignment = align
     para.lineBreakMode = .byWordWrapping
@@ -173,22 +234,15 @@ func drawTitle(_ ctx: CGContext, text: String, box: CGRect, size: CGFloat, align
         .foregroundColor: NSColor.white,
         .paragraphStyle: para,
     ]
-    let ns = NSAttributedString(string: text, attributes: attrs)
-    let g = NSGraphicsContext.current!
-    NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = g
-    ns.draw(with: box, options: [.usesLineFragmentOrigin, .usesFontLeading])
-    NSGraphicsContext.restoreGraphicsState()
-    _ = ctx
+    NSAttributedString(string: text, attributes: attrs)
+        .draw(with: box, options: [.usesLineFragmentOrigin, .usesFontLeading])
 }
 
 // ── 渲染一张 ──
-func render(size: NSSize, title: String, sub: String, photo: String?, titleBox: CGRect,
-            titleAlign: NSTextAlignment, mark: CGRect, maxLines: Int, scrim: CGFloat,
-            out: String, jpeg: Bool) {
-    // 用**显式像素尺寸**的位图上下文，不用 lockFocus：Retina 屏上 lockFocus 会按
-    // backing scale 渲染成 2 倍大（实测 600×900 出来是 1200×1800），Steam 那边
-    // 尺寸就不对了。
+func render(size: NSSize, title: String, sub: String, look: Look, titleBox: CGRect,
+            titleAlign: NSTextAlignment, mark: CGRect, iconCenter: CGPoint, iconMax: CGFloat,
+            maxLines: Int, out: String, jpeg: Bool) {
+    // 显式像素尺寸的位图上下文：Retina 上 lockFocus 会渲染成 2 倍大（实测）
     guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
                                      pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
                                      bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
@@ -200,18 +254,19 @@ func render(size: NSSize, title: String, sub: String, photo: String?, titleBox: 
     NSGraphicsContext.saveGraphicsState()
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
-    if let p = photo, !p.isEmpty {
-        drawPhoto(ctx, path: p, size: size, scrim: scrim, overall: 0.28)
+
+    if let f = look.fill, !f.isEmpty {
+        drawFill(ctx, path: f, size: size, overall: 0.28, scrim: 0.9)
     } else {
-        drawGradient(ctx, size: size)
-        // 标题上方一道短竖线（Steam 蓝），没底图时做视觉锚点
-        ctx.setFillColor(NSColor(calibratedRed: 0.10, green: 0.62, blue: 1.0, alpha: 1).cgColor)
-        ctx.fill(CGRect(x: titleBox.minX, y: titleBox.maxY + 22, width: 64, height: 6))
+        drawGradient(ctx, size: size, tintFrom: look.tintFrom)
+    }
+    if let ic = look.icon, !ic.isEmpty {
+        drawIcon(ctx, path: ic, center: iconCenter, maxSide: iconMax)
     }
     let fs = fitFontSize(title, font: { NSFont.boldSystemFont(ofSize: $0) },
                          box: titleBox.size, maxLines: maxLines,
                          oneLineMin: size.width > 500 ? 34 : 22)
-    drawTitle(ctx, text: title, box: titleBox, size: fs, align: titleAlign)
+    drawTitle(title, box: titleBox, size: fs, align: titleAlign)
     if !sub.isEmpty {
         let para = NSMutableParagraphStyle()
         para.alignment = titleAlign
@@ -221,7 +276,7 @@ func render(size: NSSize, title: String, sub: String, photo: String?, titleBox: 
             .paragraphStyle: para,
         ]
         NSAttributedString(string: sub, attributes: attrs)
-            .draw(with: CGRect(x: titleBox.minX, y: 34, width: titleBox.width, height: 60),
+            .draw(with: CGRect(x: titleBox.minX, y: 30, width: titleBox.width, height: 60),
                   options: [.usesLineFragmentOrigin])
     }
     drawMark(ctx, x: mark.minX, y: mark.minY, height: mark.height, alpha: 0.5)
@@ -235,22 +290,26 @@ func render(size: NSSize, title: String, sub: String, photo: String?, titleBox: 
     }
 }
 
-// ── 竖版封面 600×900（加进库时看到的大图）──
-let hasPhoto = !(imagePath ?? "").isEmpty
-render(size: NSSize(width: 600, height: 900), title: name, sub: subtitle, photo: imagePath,
-       titleBox: hasPhoto ? CGRect(x: 56, y: 150, width: 488, height: 400)   // 有底图：压在下半部分
-                          : CGRect(x: 56, y: 300, width: 488, height: 430),  // 纯排版：居中
+// ── 竖版封面 600×900 ──
+render(size: NSSize(width: 600, height: 900), title: name, sub: subtitle, look: look,
+       // 铺满底图 → 标题压在下半；放图标 → 标题让到下方、图标占中间；纯排版 → 居中
+       titleBox: hasFill ? CGRect(x: 56, y: 140, width: 488, height: 380)
+                : hasIcon ? CGRect(x: 56, y: 110, width: 488, height: 300)
+                          : CGRect(x: 56, y: 300, width: 488, height: 430),
        titleAlign: .center,
-       mark: CGRect(x: 278, y: 96, width: 44, height: 44 * MARK_H / MARK_W),
-       maxLines: 5, scrim: 0.9, out: outPath, jpeg: false)
+       mark: CGRect(x: 278, y: 52, width: 44, height: 44 * MARK_H / MARK_W),
+       iconCenter: CGPoint(x: 300, y: 610), iconMax: 360,
+       maxLines: 5, out: outPath, jpeg: false)
 
-// ── 横版头图 460×215（列表 / 最近游戏）──
+// ── 横版头图 460×215 ──
 if let hp = headerPath, !hp.isEmpty {
-    render(size: NSSize(width: 460, height: 215), title: name, sub: "", photo: imagePath,
-           titleBox: hasPhoto ? CGRect(x: 28, y: 34, width: 330, height: 120)
+    render(size: NSSize(width: 460, height: 215), title: name, sub: "", look: look,
+           titleBox: hasIcon ? CGRect(x: 28, y: 56, width: 250, height: 110)
+                    : hasFill ? CGRect(x: 28, y: 34, width: 330, height: 120)
                               : CGRect(x: 28, y: 74, width: 330, height: 110),
            titleAlign: .left,
-           mark: CGRect(x: 408, y: 20, width: 26, height: 26 * MARK_H / MARK_W),
-           maxLines: 3, scrim: 0.9, out: hp, jpeg: true)
+           mark: CGRect(x: 408, y: 12, width: 26, height: 26 * MARK_H / MARK_W),
+           iconCenter: CGPoint(x: 372, y: 110), iconMax: 130,
+           maxLines: 3, out: hp, jpeg: true)
 }
 print(outPath)

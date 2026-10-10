@@ -38,6 +38,9 @@ cfg_get() { sed -n "s/^$1=[\"']\{0,1\}\([^\"'#]*\).*/\1/p" "$MAC_DIR/config.env"
 DECK_SSH="$(cfg_get DECK_SSH)";           DECK_SSH="${DECK_SSH:-deck}"
 DECK_HOST="$(cfg_get DECK_HOST)";         DECK_HOST="${DECK_HOST:-steamdeck.local}"
 DECK_GAMES_ROOT="$(cfg_get DECK_GAMES_ROOT)"; DECK_GAMES_ROOT="${DECK_GAMES_ROOT:-~/deckkit/services/games}"
+DECK_HOME="$(cfg_get DECK_HOME)"; DECK_HOME="${DECK_HOME:-/home/deck}"
+# 传给 scp / 远端脚本的**文件路径用绝对路径**：scp 现在走 SFTP，远端 ~ 不一定展开
+DECK_GAMES_ABS="$DECK_HOME/deckkit/services/games"
 SSH_TIMEOUT="$(cfg_get SSH_TIMEOUT)";     SSH_TIMEOUT="${SSH_TIMEOUT:-10}"
 KEEP_INSTALLER_ON_DECK="$(cfg_get KEEP_INSTALLER_ON_DECK)"
 
@@ -756,8 +759,9 @@ cmd_install_here() {
   rsync -a "$DECK_DIR/gamectl.sh" "$DECK_SSH:$DECK_GAMES_ROOT/gamectl.sh" || die "上传 gamectl.sh 失败"
   rsync -a "$DECK_DIR/shortcut-vdf.py" "$DECK_SSH:$DECK_GAMES_ROOT/shortcut-vdf.py" || die "上传 shortcut-vdf.py 失败"
   rsync -a "$DECK_DIR/compat-tool.py" "$DECK_SSH:$DECK_GAMES_ROOT/compat-tool.py" || die "上传 compat-tool.py 失败"
-  rsh "chmod 755 \"\${HOME}/deckkit/services/games/gamectl.sh\" \"\${HOME}/deckkit/services/games/shortcut-vdf.py\" \"\${HOME}/deckkit/services/games/compat-tool.py\""
-  ok "Deck 侧就位（gamectl.sh + shortcut-vdf.py）"
+  rsync -a "$DECK_DIR/peicon.py" "$DECK_SSH:$DECK_GAMES_ROOT/peicon.py" || die "上传 peicon.py 失败"
+  rsh "chmod 755 \"\${HOME}/deckkit/services/games/gamectl.sh\" \"\${HOME}/deckkit/services/games/shortcut-vdf.py\" \"\${HOME}/deckkit/services/games/compat-tool.py\" \"\${HOME}/deckkit/services/games/peicon.py\""
+  ok "Deck 侧就位（gamectl.sh + shortcut-vdf.py + compat-tool.py + peicon.py）"
   ok "Proton：$(gctl protons | tr '\n' ' ')"
   dim "  下一步：deck games add '<setup.exe|游戏目录>'"
 }
@@ -832,10 +836,13 @@ deck_find_art() {
 }
 
 cmd_cover() {
-  local want="" image="" find_mode=0 quiet=0 subtitle="非 Steam 游戏 · deckkit"
+  local want="" image="" find_mode=0 quiet=0 no_icon=0 icon_fill=0 reicon=0 subtitle="非 Steam 游戏 · deckkit"
   while [ $# -gt 0 ]; do
     case "$1" in
       --image) shift; image="${1:-}" ;;
+      --no-icon) no_icon=1 ;;                  # 不要图标，退回纯排版封面
+      --reicon) reicon=1 ;;                    # 丢掉缓存，重新从 exe 抠一次图标
+      --icon-fill) icon_fill=1 ;;              # 把主程序图标铺满整张（默认是居中放 + 渐变取色）
       --find) find_mode=1 ;;
       --quiet) quiet=1 ;;
       --subtitle) shift; subtitle="${1:-}" ;;
@@ -887,11 +894,35 @@ cmd_cover() {
     fi
     if [ -n "$image" ] && [ ! -f "$image" ]; then die "找不到图片：$image"; fi
 
+    # 图标：先从主程序 exe 里抠一份存到 store（缓存，下次直接用），再拉到 Mac 渲染
+    local icon_local="" rexe
+    rexe="$(rsh "sed -n 's/^game_exe=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1)"
+    if [ "$no_icon" = 0 ] && [ -z "$image" ]; then
+      [ "$reicon" = 1 ] && rsh "rm -f \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null
+      if ! rsh "test -s \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null && [ -n "$rexe" ]; then
+        rsh "python3 \"$DECK_GAMES_ABS/peicon.py\" \"$rexe\" --best \"$DECK_GAMES_ABS/store/$slug/icon.png\"" >/dev/null 2>&1 || true
+      fi
+      if rsh "test -s \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null; then
+        mkdir -p "$COVER_TMP/$appid"
+        if scp -q "${SSH_OPTS[@]}" "$DECK_SSH:$DECK_GAMES_ABS/store/$slug/icon.png" "$COVER_TMP/$appid/icon.png" 2>/dev/null; then
+          icon_local="$COVER_TMP/$appid/icon.png"
+          [ "$quiet" = 1 ] || dim "  图标：主程序自带（$(sips -g pixelWidth "$icon_local" 2>/dev/null | tail -1 | tr -dc 0-9)px）"
+        fi
+      else
+        [ "$quiet" = 1 ] || dim "  主程序里没有图标资源，退回排版封面"
+      fi
+    fi
+
     mkdir -p "$COVER_TMP/$appid"
+    # 注意：`${icon_fill:+--icon-fill}` 这种写法对 0/1 开关是**错的** ——
+    # icon_fill=0 也是"非空"，那个开关会永远生效（实测所有封面都变成了铺满模式）。
+    local extra=""
+    [ "$icon_fill" = 1 ] && extra="--icon-fill"
     if ! swift "$SVC_DIR/mac/cover.swift" --name "$name" \
          --out "$COVER_TMP/$appid/${appid}p.png" \
          --header "$COVER_TMP/$appid/${appid}_header.jpg" \
-         ${img:+--image "$img"} ${subtitle:+--subtitle "$subtitle"} >/dev/null; then
+         ${img:+--image "$img"} ${icon_local:+--icon "$icon_local"} \
+         $extra ${subtitle:+--subtitle "$subtitle"} >/dev/null; then
       warn "渲染失败，跳过：$name"; skip_n=$((skip_n + 1)); continue
     fi
 
@@ -938,7 +969,7 @@ cmd_help() {
     deck games add <exe>    装（自动切桌面模式、杀 Steam、装完收尾）
     deck games add <目录|主程序>  免安装游戏（整份拷到 Deck，挑主程序，登记 Steam）
     deck games rm <名字>     卸载（Steam 列表条目 + 游戏本体一起清）
-    deck games cover <名字|all>  生成封面写进 Steam 的 grid（装完会自动做）
+    deck games cover <名字|all>  生成封面写进 Steam 的 grid（装完会自动做；用主程序自带图标）
 EOF
   dim "  其它：deck games shortcut <名字> 只登记 Steam 条目 / protons / verify；全部：deck games help-all"
 }

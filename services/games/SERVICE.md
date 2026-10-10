@@ -80,19 +80,28 @@ Steam 给「非 Steam 快捷方式」的封面就是往它自己的 grid 目录�
 | `userdata/<id>/config/grid/<appid>_header.jpg` | 列表 / 最近游戏的头图 | 460×215 |
 
 ```bash
-deck games cover <名字|all>             # 排版封面：深色渐变 + 标题 + Steam Deck 标记
-deck games cover <名字> --image 图.png   # 拿自己的图当底图（居中裁切 + 压暗 + 标题）
-deck games cover <名字> --find          # 在游戏目录里找像 title/cover/box/package/jacket/logo 的图当底图
+deck games cover <名字|all>             # 默认：主程序自带图标居中 + 背景按图标主色上色 + 标题
+deck games cover <名字> --icon-fill     # 把图标铺满整张
+deck games cover <名字> --image 图.png   # 拿别的图铺满（居中裁切 + 压暗 + 标题）
+deck games cover <名字> --find          # 在游戏目录里找像 title/cover/box/package/jacket/logo 的图铺满
+deck games cover <名字> --no-icon       # 不要图标，退回纯排版封面（深色渐变 + 标题）
+deck games cover <名字> --reicon        # 丢掉缓存的图标，重新从 exe 抠一次
 ```
 
 - **装完自动做**：`deck games add` 登记完 Steam 条目就顺手写封面（`--no-cover` 跳过）。
-- **图在 Mac 上渲染**（`mac/cover.swift`，Deck 上没有 AppKit）：排版封面不依赖任何素材；
-  短名字（OpenTTD）尽量一行、长中文标题自动折行放大填满版面。
+- **图标从主程序 exe 里抠**：`deck/peicon.py` 纯 Python 解析 PE 资源
+  （`RT_GROUP_ICON` 描述 + `RT_ICON` 数据，256px 那种直接存 PNG、老的 DIB 自己解位深），
+  取**最大的一张**，缓存在 `store/<slug>/icon.png`。Deck 上没有 icoutils 也不用装 —— 不需要。
+- **图在 Mac 上渲染**（`mac/cover.swift`，Deck 上没有 AppKit）：背景渐变按图标的主色上色
+  （不是一坨灰），图标居中放一枚（小图标不硬拉大，64px 的放到 170px 为止）；短名字
+  （OpenTTD）保持一行、长中文标题自动折行放大填满版面。
 - `--find` 只认名字里带 `title/cover/box/package/jacket/logo` 的图，**不会**去抓
   `bgimage/` 那种 CG —— 自动挑到不该露的图，比没封面更糟。想用哪张，`--image` 明说。
+  （注意：**exe 自带的图标本身就是游戏作者放的图**，个别游戏会是很露骨的那种 ——
+  那种就用 `--no-icon` 或 `--image` 换掉。）
 - 覆盖之前会把**用户自己放过的**封面留一份 `<appid>p.png.deckkit-bak`（靠 store 里的
   `cover.own` 标记区分"是不是 deckkit 写的"，所以重新生成时不会反复备份自己的图）；
-  `deck games rm` 会把封面、备份和标记一起清掉。
+  `deck games rm` 会把封面、备份、缓存的图标和标记一起清掉。
 - **Steam 正在跑的话，要重启 Steam（或切一次 Gaming/桌面模式）才看得到新封面。**
 
 ## 已知边界

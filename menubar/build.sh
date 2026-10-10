@@ -10,10 +10,9 @@
 #  产物是一个 LSUIElement（无 Dock 图标）的小 App：双击常驻菜单栏，
 #  也可以在「系统设置 → 通用 → 登录项」里加进开机自启。
 #
-#  装到 /Applications 之后，**那份才是正主**：本脚本默认改成「编译 + 重新安装 +
-#  重启 /Applications 那份」（只编不装会让你以为改了没生效）。要只编仓库里这份，
-#  用 --dev。App 靠 Info.plist 里的 DeckkitRoot 找仓库（services/、bin/deck），
-#  所以仓库别删、别随便挪 —— 挪了要重新 --install。
+#  默认编译仓库里那份并（原来在跑就）重启它 —— 平时就用源码版。
+#  想装到 /Applications（常驻、加进登录项）就显式 `deck menu --install`，
+#  之后要回到源码版：`deck menu --dev`（会停掉 /Applications 那份再起仓库这份）。
 # ============================================================
 set -euo pipefail
 
@@ -35,13 +34,11 @@ for a in "$@"; do
   case "$a" in
     --run)     RUN=1 ;;
     --install) INSTALL=1 ;;
-    --dev)     DEV_ONLY=1 ;;
+    --dev)     DEV_ONLY=1 ;;      # 显式「就用源码版」：默认就是这个，写出来更清楚
   esac
 done
-# 装了 /Applications 那份之后，默认就一直维护它（不然改完代码只编仓库这份，
-# 跑着的还是旧 App —— 菜单栏没变化，白折腾）
-if [ "${DEV_ONLY}" != 1 ] && [ -d "$APP_INSTALLED" ]; then
-  INSTALL=1
+if [ "${DEV_ONLY}" = 1 ] && [ "${INSTALL}" = 1 ]; then
+  die "--dev 和 --install 不能一起用"
 fi
 
 # 记下编译前是否在跑：在跑的话编完自动拉起来，
@@ -149,9 +146,13 @@ if [ "${INSTALL}" = 1 ]; then
   ok "已安装：${APP_INSTALLED}"
 fi
 
-# 启动/重启哪一个：装了就以 /Applications 那份为准
+# 启动/重启哪一个：只有这次真的 --install 了才起 /Applications 那份，
+# 否则一律起仓库里这份（源码版）—— 两份同时跑会出现两个菜单栏图标。
 TARGET="${APP}"
-[ -d "${APP_INSTALLED}" ] && TARGET="${APP_INSTALLED}"
+# 注意写成 if：`[ … ] && TARGET=…` 在 INSTALL=0 时整条为假，set -e 会直接把脚本干掉（实测）
+if [ "${INSTALL}" = 1 ]; then
+  TARGET="${APP_INSTALLED}"
+fi
 echo "启动：open '${TARGET}'"
 echo "开机自启：系统设置 → 通用 → 登录项 → 添加 DeckKit.app"
 

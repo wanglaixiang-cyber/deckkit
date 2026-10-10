@@ -70,6 +70,31 @@ MyGame ver1.01（SRPG Studio，878M 免安装目录）：
     run.sh → game.exe 15.9% CPU + 窗口「MyGame」1024x768 ✓
 ```
 
+## 封面（`deck games cover`）
+
+Steam 给「非 Steam 快捷方式」的封面就是往它自己的 grid 目录里丢文件 —— 不用碰 Steam 的任何配置：
+
+| 文件 | 用途 | 尺寸 |
+|---|---|---|
+| `userdata/<id>/config/grid/<appid>p.png` | 库里的大封面（Gaming Mode 的网格就是它） | 600×900 |
+| `userdata/<id>/config/grid/<appid>_header.jpg` | 列表 / 最近游戏的头图 | 460×215 |
+
+```bash
+deck games cover <名字|all>             # 排版封面：深色渐变 + 标题 + Steam Deck 标记
+deck games cover <名字> --image 图.png   # 拿自己的图当底图（居中裁切 + 压暗 + 标题）
+deck games cover <名字> --find          # 在游戏目录里找像 title/cover/box/package/jacket/logo 的图当底图
+```
+
+- **装完自动做**：`deck games add` 登记完 Steam 条目就顺手写封面（`--no-cover` 跳过）。
+- **图在 Mac 上渲染**（`mac/cover.swift`，Deck 上没有 AppKit）：排版封面不依赖任何素材；
+  短名字（OpenTTD）尽量一行、长中文标题自动折行放大填满版面。
+- `--find` 只认名字里带 `title/cover/box/package/jacket/logo` 的图，**不会**去抓
+  `bgimage/` 那种 CG —— 自动挑到不该露的图，比没封面更糟。想用哪张，`--image` 明说。
+- 覆盖之前会把**用户自己放过的**封面留一份 `<appid>p.png.deckkit-bak`（靠 store 里的
+  `cover.own` 标记区分"是不是 deckkit 写的"，所以重新生成时不会反复备份自己的图）；
+  `deck games rm` 会把封面、备份和标记一起清掉。
+- **Steam 正在跑的话，要重启 Steam（或切一次 Gaming/桌面模式）才看得到新封面。**
+
 ## 已知边界
 
 - **Deck 要在桌面模式**才能看到安装向导 —— 服务会自动切过去，不用你手动切。

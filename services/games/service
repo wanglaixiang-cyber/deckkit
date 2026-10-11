@@ -829,6 +829,7 @@ cmd_install_here() {
   rsync -a "$DECK_DIR/shortcut-vdf.py" "$DECK_SSH:$DECK_GAMES_ROOT/shortcut-vdf.py" || die "上传 shortcut-vdf.py 失败"
   rsync -a "$DECK_DIR/compat-tool.py" "$DECK_SSH:$DECK_GAMES_ROOT/compat-tool.py" || die "上传 compat-tool.py 失败"
   rsync -a "$DECK_DIR/peicon.py" "$DECK_SSH:$DECK_GAMES_ROOT/peicon.py" || die "上传 peicon.py 失败"
+  rsync -a "$DECK_DIR/padcfg.py" "$DECK_SSH:$DECK_GAMES_ROOT/padcfg.py" || die "上传 padcfg.py 失败"
   rsh "chmod 755 \"\${HOME}/deckkit/services/games/gamectl.sh\" \"\${HOME}/deckkit/services/games/shortcut-vdf.py\" \"\${HOME}/deckkit/services/games/compat-tool.py\" \"\${HOME}/deckkit/services/games/peicon.py\""
   ok "Deck 侧就位（gamectl.sh + shortcut-vdf.py + compat-tool.py + peicon.py）"
   ok "Proton：$(gctl protons | tr '\n' ' ')"
@@ -875,6 +876,89 @@ cmd_clean() {
   [ "$n" = 0 ] && { ok "没有残留记录"; return 0; }
   rsh 'for f in "$HOME"/deckkit/services/games/store/*/meta.tsv; do grep -q "已卸载" "$f" 2>/dev/null && rm -rf "$(dirname "$f")"; done'
   ok "清掉 ${n} 条残留记录"
+}
+
+# ───────────────── Steam Input 手柄布局（deck games pad）─────────────────
+# 非 Steam 游戏大多没有手柄支持，界面只能靠触控板 —— Steam Input 就是"把手柄当
+# 鼠标/键盘"的那一层，而且**不用碰游戏本体**。每个快捷方式的布局存在：
+#   .../steamapps/common/Steam Controller Configs/<steamid>/config/<key>/controller_neptune.vdf
+# key = 快捷方式名字小写去点（实测对出来过：`MyGame2 V2.0版+…` → `…v20版+…`），
+# 并在同目录 configset_controller_neptune.vdf 里用 `"<key>" { "autosave" "1" }` 登记。
+# 映射本体直接取 Steam 自带的 Deck 模板（controller_base/templates/controller_neptune_*.vdf）。
+# 注意：Steam 运行时会把这些配置缓存在内存里、退出时回写，所以**真写必须让 Steam 停着**
+# （和写 shortcuts.vdf 一个道理，用 ensure_session）；--list / --dry-run 可以边跑边看。
+cmd_pad() {
+  local want="" tpl="mouse" key="" do_list=0 dry=0 do_rm=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--template) shift; tpl="${1:-mouse}" ;;
+      --key) shift; key="${1:-}" ;;
+      -l|--list) do_list=1 ;;
+      -n|--dry-run) dry=1 ;;
+      --rm|--remove) do_rm=1 ;;
+      -*) die "pad: 不认识的选项 $1（见 deck games help-all）" ;;
+      *) want="$1" ;;
+    esac
+    shift
+  done
+  require_deck
+
+  local base cid cfgdir pc
+  base="$DECK_HOME/.local/share/Steam/steamapps/common/Steam Controller Configs"
+  cid="$(rsh "ls -1 \"$base\" 2>/dev/null | head -1")"
+  [ -n "$cid" ] || die "Deck 上没找到 Steam Controller Configs（Steam 至少启动过一次才会建它）"
+  cfgdir="$base/$cid/config"
+  pc="$DECK_GAMES_ABS/padcfg.py"
+  rsh "test -f \"$pc\"" || die "Deck 上还没有 padcfg.py —— 先跑 deck games install-here"
+
+  local slugs="" r
+  if [ -z "$want" ] || [ "$want" = all ] || [ "$do_list" = 1 ]; then
+    do_list=1
+    slugs="$(games_table | cut -f1)"
+  else
+    r="$(resolve_slug "$want")"
+    [ -n "$r" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+    slugs="$r"
+  fi
+  [ -n "$slugs" ] || { warn "还没有装过游戏"; return 0; }
+
+  # 名字+appid 清单传到 Deck（中文名不往 ssh 命令行里塞，省得转义）
+  mkdir -p "$COVER_TMP"
+  local tmp="$COVER_TMP/pad-games.tsv" slug nm ap n=0
+  : > "$tmp"
+  for slug in $slugs; do
+    nm="$(mget "$slug" name)"; ap="$(mget "$slug" appid)"
+    [ -n "$ap" ] || continue
+    printf '%s\t%s\n' "$ap" "$nm" >> "$tmp"
+  done
+  scp -q "${SSH_OPTS[@]}" "$tmp" "$DECK_SSH:/tmp/deckkit-pad-games.tsv" || die "传清单失败"
+
+  if [ "$do_list" = 1 ]; then
+    hdr "手柄布局现状"
+    rsh "python3 \"$pc\" list --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv"
+    dim "  可装模板：mouse（仅鼠标）/ gamepad+mouse / wasd / webbrowser / fps / joystick / touchscreen"
+    return 0
+  fi
+
+  # 真写：Steam 必须停着（它会回写覆盖）
+  [ "$dry" = 1 ] || ensure_session
+
+  hdr "安装手柄布局"
+  for slug in $slugs; do
+    ap="$(mget "$slug" appid)"; [ -n "$ap" ] || continue
+    say ""
+    rsh "python3 \"$pc\" $([ "$do_rm" = 1 ] && echo remove || echo install) \
+           --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv --appid \"$ap\" \
+           --template \"$tpl\" ${key:+--key \"$key\"} ${dry:+--dry-run}"
+    n=$((n + 1))
+  done
+  if [ "$do_rm" = 1 ]; then
+    ok "撤掉 $n 个游戏的布局（Steam 里会回到默认）"
+  else
+    ok "$n 个游戏写好了（模板 ${tpl}）"
+    dim "  重启 Steam（或切一次 Gaming/桌面模式）后：游戏页面 → 手柄图标 → 看一下布局名"
+    dim "  界面里也能改：想微调就用 Steam 的布局编辑器，改完存成个人布局"
+  fi
 }
 
 # ─────────────────────── 交互式游戏管理（TUI）───────────────────────
@@ -1348,6 +1432,7 @@ cmd_help() {
     deck games rm <名字>     卸载（Steam 列表条目 + 游戏本体一起清）
     deck games cover <名字|all>  生成封面写进 Steam 的 grid（装完会自动做；用主程序自带图标）
     deck games fix <名字|all>    维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK（点开始没反应时先跑它）
+    deck games pad [<名字|all>]  手柄布局：右摇杆当鼠标等（--list 看现状，--template 选模板）
 EOF
   dim "  其它：deck games shortcut <名字> 只登记 Steam 条目 / protons / verify；全部：deck games help-all"
 }
@@ -1380,6 +1465,7 @@ case "${1:-}" in
   add)            shift; cmd_install "$@" ;;      # 简写：deck games add <exe>
   cover)          shift; cmd_cover "$@" ;;        # 生成立绘/封面写进 Steam 的 grid 目录
   fix)            shift; cmd_fix "$@" ;;          # 维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK
+  pad)            shift; cmd_pad "$@" ;;          # 手柄布局（Steam Input）：把右摇杆当鼠标等
   rm|del|remove)  shift; cmd_rm "$@" ;;           # 简写：deck games rm <名字>（条目+本体一起删）
   clean)          cmd_clean ;;                    # 清掉残留的"已卸载"记录
   help|--help|-h) cmd_help ;;

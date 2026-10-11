@@ -192,6 +192,7 @@ deck games add '.../游戏目录/game.exe' # 免安装游戏：**选主程序**�
 deck games add '<主程序>' --root ..     # 主程序在 bin/ 里、数据在上一层：连上一层一起拷
 deck games cover 'all'                 # 给库里的游戏生成封面：用 exe 自带的图标 + 标题（装完自动做）
 deck games fix '<名字>'                # 点开始没反应？重挑主程序 + 挪开游戏自带的 Windows 版 DXVK
+deck games pad --list                  # 手柄布局现状；pad <名字> -t mouse 让右摇杆当鼠标
 deck games shortcut <名字>             # 补登记（装完会自动登记）
 deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体（目录/prefix），一次清掉
 ```

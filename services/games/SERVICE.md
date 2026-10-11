@@ -136,6 +136,47 @@ deck status       # 完整状态（全量 dump）
 - stdin/stdout 不是终端时（`deck games | cat`、脚本里）自动退回原来的概览，不会画界面。
 - 菜单栏那条「游戏管理（终端 · 方向键操作）」调的就是它；「完整状态（终端）」是另一条。
 
+## 手柄布局：让右摇杆当鼠标（`deck games pad`）
+
+非 Steam 游戏大多没有手柄支持，界面只能靠触控板 —— 这不是游戏的问题，是 **Steam Input**
+那一层没配好。改的是 Steam 的手柄布局，**不用碰游戏本体**：
+
+```bash
+deck games pad --list                    # 看每个游戏现在用的是什么布局（只读，Steam 跑着也能看）
+deck games pad <名字|all>                # 装「仅鼠标」布局（默认）
+deck games pad <名字> -t gamepad+mouse   # 换模板：mouse / gamepad+mouse / wasd / webbrowser / fps / joystick / touchscreen
+deck games pad <名字> --dry-run          # 只生成不落地（写 ~/deckkit-pad-dryrun，方便先看）
+deck games pad <名字> --rm               # 撤掉，回到 Steam 默认（有备份就还原备份）
+```
+
+- **配置存在哪**：`~/.local/share/Steam/steamapps/common/Steam Controller Configs/<steamid>/config/<key>/controller_neptune.vdf`，
+  并在同目录 `configset_controller_neptune.vdf` 里用 `"<key>" { "autosave" "1" }` 登记。
+- **`<key>` 的规则**：快捷方式名字转小写 + 去掉 `.`（实测验证：`MyGame2 V2.0版+…` →
+  `MyGame2 v20版+…`、`UkiyoGensoEnnichi` → `ukiyogensoennichi`，都能对上机器上已有的目录）。
+  非 Steam 快捷方式用**名字**当 key 而不是 appid —— 因为改名以后 appid 会变。
+- **映射本体**直接取 Steam 自带的 Deck 模板（`~/.steam/steam/controller_base/templates/controller_neptune_*.vdf`）；
+  header 字段（creator/progenitor/url/controller_caps…）照 Steam 自己写的那份生成，
+  实测和 Steam 自己的配置文件**字段名逐行一致**；行尾统一成 LF（模板是 CRLF、Steam 写出来是 LF）。
+- **真写必须让 Steam 停着**（它会把这些配置缓存在内存里、退出时回写），命令会自动处理会话
+  （退出 Steam、需要时切桌面模式）；`--list` / `--dry-run` 不受影响。
+- 装完**重启 Steam（或切一次模式）**，在游戏页面 → 手柄图标（控制器布局）里能看到布局名。
+  界面里也能直接改：模板 → 「仅鼠标」/「游戏手柄 + 鼠标」→ 应用，效果和本命令一致。
+
+Deck 上两个模板的实际映射（解析 `controller_neptune_*.vdf` 得到）：
+
+| | 仅鼠标 `mouse` | 游戏手柄 + 鼠标 `gamepad+mouse` |
+|---|---|---|
+| 右摇杆 | **鼠标移动**（`joystick_mouse`） | 鼠标移动 |
+| 右触控板 | **绝对式鼠标**（`absolute_mouse`） | 鼠标移动 |
+| A / X | 鼠标左键 / 右键 | `xinput A` / `X` |
+| B | Esc | `xinput B` |
+| 方向键 | 鼠标左键 / 右键（可当确认与返回） | `xinput dpad_*` |
+| LB / RB | 滚轮上 / 下 | `xinput shoulder_*` |
+| 扳机 | 左 / 右键 | 左 / 右键 |
+
+**怎么选**：游戏完全不认手柄（视觉小说、点选 UI）→ `mouse`；游戏认手柄但界面要鼠标
+（Unity 小游戏、部分 RPG）→ `gamepad+mouse`；要靠键盘走的界面 → `wasd`。
+
 ## 点开始没反应？先跑 `deck games fix`
 
 实测两个坑，都是"Steam 里点了开始，什么都没发生"，`fix` 一次收拾：

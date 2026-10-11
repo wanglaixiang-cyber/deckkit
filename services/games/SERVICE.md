@@ -143,12 +143,18 @@ deck status       # 完整状态（全量 dump）
 
 ```bash
 deck games pad --list                    # 看每个游戏现在用的是什么布局（只读，Steam 跑着也能看）
+deck games pad --appid 2739590 --list    # Steam 正版游戏也能看/改（配置目录名就是 appid）
+deck games pad --appid 2739590 -s 150    # 只调"右摇杆当鼠标"的灵敏度（不动别的映射）
 deck games pad <名字|all>                # 装「仅鼠标」布局（默认）
 deck games pad <名字> -t gamepad+mouse   # 换模板：mouse / gamepad+mouse / wasd / webbrowser / fps / joystick / touchscreen
 deck games pad <名字> --dry-run          # 只生成不落地（写 ~/deckkit-pad-dryrun，方便先看）
 deck games pad <名字> --rm               # 撤掉，回到 Steam 默认（有备份就还原备份）
 ```
 
+- **`-s/--sensitivity N`**：只把 mouse 类输入（右摇杆 `joystick_mouse`、右触控板 `absolute_mouse`）
+  的 `"sensitivity"` 改掉，其它映射一行不动（实测 diff 就两行）。Steam 默认偏慢，够不到按钮时先试这个。
+- **游戏正在跑的时候别用真写**：会退出 Steam（等于关掉你的游戏）。急着改就直接在游戏里按
+  `STEAM` 键 → 控制器设置 → 编辑布局 → 右摇杆灵敏度，改完**立即生效**，不用重启。
 - **配置存在哪**：`~/.local/share/Steam/steamapps/common/Steam Controller Configs/<steamid>/config/<key>/controller_neptune.vdf`，
   并在同目录 `configset_controller_neptune.vdf` 里用 `"<key>" { "autosave" "1" }` 登记。
 - **`<key>` 的规则**：快捷方式名字转小写 + 去掉 `.`（实测验证：`MyGame2 V2.0版+…` →

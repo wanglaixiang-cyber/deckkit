@@ -130,6 +130,86 @@ def build_header(appid, creator, url_path, caps):
     return "\n".join(lines) + "\n"
 
 
+def block_span(text, open_idx):
+    """从 text[open_idx] == '{' 开始，返回配对的 '}' 的下标（含）。"""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def set_sensitivity(block, value):
+    """在 group 块里把 mouse 类输入的灵敏度设成 value（没有 settings 块就在末尾加一个）。"""
+    m = re.search(r'\n(\t+)"settings"\s*\n\t*\{\n', block)
+    if m:
+        open_idx = block.index('{', m.start())
+        close = block_span(block, open_idx)
+        if close < 0:
+            return block, False
+        seg = block[open_idx:close]
+        indent = m.group(1) + "\t"
+        if '"sensitivity"' in seg:
+            seg2 = re.sub(r'"sensitivity"\s+"[^"]*"', '"sensitivity"\t\t"%s"' % value, seg)
+        else:
+            seg2 = "{\n" + indent + '"sensitivity"\t\t"%s"\n' % value + seg[seg.index("\n") + 1:]
+        return block[:open_idx] + seg2 + block[close:], True
+    # 没有 settings：在 group 收尾前插一个
+    close = block_span(block, block.index('{'))
+    if close < 0:
+        return block, False
+    indent = "\t\t"
+    add = '%s"settings"\n%s{\n%s\t"sensitivity"\t\t"%s"\n%s}\n' % (indent, indent, indent, value, indent)
+    return block[:close] + add + block[close:], True
+
+
+def do_sens(cfgdir, name, key, appid, value, dry, outdir):
+    k = key or key_of(name)
+    if appid and not os.path.isdir(os.path.join(cfgdir, k)) and os.path.isdir(os.path.join(cfgdir, appid)):
+        k = appid
+    f = os.path.join(cfgdir, k, "controller_neptune.vdf")
+    if not os.path.isfile(f):
+        print("还没有布局文件：%s（先用 install 装一份）" % f, file=sys.stderr)
+        return 1
+    txt = open(f, encoding="utf-8", errors="replace").read().replace("\r\n", "\n")
+    out = []
+    pos = 0
+    hit = 0
+    for m in re.finditer(r'^\t"group"\s*\n\t\{\n', txt, re.M):
+        open_idx = txt.index('{', m.start())
+        close = block_span(txt, open_idx)
+        block = txt[m.start():close + 1]
+        if re.search(r'^\t\t"mode"\s+"(joystick_mouse|absolute_mouse)"\s*$', block, re.M):
+            nb, ok = set_sensitivity(block, value)
+            if ok:
+                out.append((m.start(), close + 1, nb)); hit += 1
+    if not hit:
+        print("这份布局里没有 mouse 类输入（joystick_mouse/absolute_mouse）", file=sys.stderr)
+        return 1
+    new = txt
+    for start, end, nb in reversed(out):
+        new = new[:start] + nb + new[end:]
+    print("灵敏度    ：%s → %s（改到 %d 个 mouse 类输入）" % (f, value, hit))
+    if dry:
+        od = outdir or os.path.join(os.path.expanduser("~"), "deckkit-pad-dryrun")
+        os.makedirs(os.path.join(od, k), exist_ok=True)
+        open(os.path.join(od, k, "controller_neptune.vdf"), "w", encoding="utf-8", newline="\n").write(new)
+        print("dry-run ：写到 %s（没碰 Steam 的目录）" % od)
+        return 0
+    if not os.path.isfile(f + ".deckkit-bak"):
+        shutil.copy2(f, f + ".deckkit-bak")
+        print("备份    ：%s.deckkit-bak" % f)
+    open(f, "w", encoding="utf-8", newline="\n").write(new)
+    print("已写入 ✓")
+    return 0
+
+
 def configset_keys(path):
     if not os.path.isfile(path):
         return []
@@ -160,6 +240,8 @@ def do_list(cfgdir, games):
     print("%-44s %-40s %-8s %s" % ("游戏", "Steam key", "目录", "当前布局"))
     for name, appid in games:
         k = key_of(name)
+        if not os.path.isdir(os.path.join(cfgdir, k)) and appid and os.path.isdir(os.path.join(cfgdir, appid)):
+            k = appid                      # Steam 正版游戏：目录名就是 appid
         d = os.path.join(cfgdir, k)
         f = os.path.join(d, "controller_neptune.vdf")
         title = "-"
@@ -241,7 +323,7 @@ def do_remove(cfgdir, name, key):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("action", choices=["list", "install", "remove"])
+    ap.add_argument("action", choices=["list", "install", "remove", "sens"])
     ap.add_argument("--cfgdir", required=True)
     ap.add_argument("--game", action="append", default=[], help="名字<TAB>appid，可重复")
     ap.add_argument("--games-file", help="每行 appid<TAB>名字")
@@ -250,6 +332,7 @@ def main():
     ap.add_argument("--template", default="mouse")
     ap.add_argument("--key")
     ap.add_argument("--creator", default="")
+    ap.add_argument("--value", help="sens 用：灵敏度数值（模板里常见 145/150）")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--outdir")
     a = ap.parse_args()
@@ -275,9 +358,13 @@ def main():
             return 2
         do_list(a.cfgdir, games)
         return 0
-    if not a.name:
-        print("install/remove 需要 --name（或 --appid 配合 --games-file）", file=sys.stderr)
+    if a.action == "sens":
+        return do_sens(a.cfgdir, a.name or (a.key or ""), a.key, a.appid, a.value or "150", a.dry_run, a.outdir)
+    if not a.name and not a.key:
+        print("install/remove 需要 --name（或 --key；Steam 游戏可以直接给 appid 当 key）", file=sys.stderr)
         return 2
+    if not a.name:
+        a.name = a.key
     if not a.appid:
         a.appid = "0"
     if a.action == "install":

@@ -888,14 +888,17 @@ cmd_clean() {
 # 注意：Steam 运行时会把这些配置缓存在内存里、退出时回写，所以**真写必须让 Steam 停着**
 # （和写 shortcuts.vdf 一个道理，用 ensure_session）；--list / --dry-run 可以边跑边看。
 cmd_pad() {
-  local want="" tpl="mouse" key="" do_list=0 dry=0 do_rm=0
+  local want="" tpl="mouse" key="" appid_target="" value="150"
+  local action="install" dry=0
   while [ $# -gt 0 ]; do
     case "$1" in
       -t|--template) shift; tpl="${1:-mouse}" ;;
       --key) shift; key="${1:-}" ;;
-      -l|--list) do_list=1 ;;
+      --appid) shift; appid_target="${1:-}" ;;      # 直接指定 appid（Steam 正版游戏也能改）
+      -s|--sensitivity) shift; value="${1:-150}"; action="sens" ;;
+      -l|--list) action="list" ;;
+      --rm|--remove) action="remove" ;;
       -n|--dry-run) dry=1 ;;
-      --rm|--remove) do_rm=1 ;;
       -*) die "pad: 不认识的选项 $1（见 deck games help-all）" ;;
       *) want="$1" ;;
     esac
@@ -911,54 +914,78 @@ cmd_pad() {
   pc="$DECK_GAMES_ABS/padcfg.py"
   rsh "test -f \"$pc\"" || die "Deck 上还没有 padcfg.py —— 先跑 deck games install-here"
 
-  local slugs="" r
-  if [ -z "$want" ] || [ "$want" = all ] || [ "$do_list" = 1 ]; then
-    do_list=1
-    slugs="$(games_table | cut -f1)"
-  else
-    r="$(resolve_slug "$want")"
-    [ -n "$r" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
-    slugs="$r"
-  fi
-  [ -n "$slugs" ] || { warn "还没有装过游戏"; return 0; }
-
-  # 名字+appid 清单传到 Deck（中文名不往 ssh 命令行里塞，省得转义）
+  # 目标清单 → games 文件（appid<TAB>名字）；中文名不往 ssh 命令行里塞
   mkdir -p "$COVER_TMP"
   local tmp="$COVER_TMP/pad-games.tsv" slug nm ap n=0
   : > "$tmp"
-  for slug in $slugs; do
-    nm="$(mget "$slug" name)"; ap="$(mget "$slug" appid)"
-    [ -n "$ap" ] || continue
-    printf '%s\t%s\n' "$ap" "$nm" >> "$tmp"
-  done
+  if [ -n "$appid_target" ]; then
+    key="${key:-$appid_target}"                        # Steam 正版游戏：目录名/key 就是 appid
+    nm="$(rsh "sed -n 's/^[[:space:]]*\"name\"[[:space:]]*\"\(.*\)\"/\1/p' \"$DECK_HOME/.steam/steam/steamapps/appmanifest_${appid_target}.acf\" 2>/dev/null | head -1")"
+    [ -n "$nm" ] || nm="appid ${appid_target}"
+    printf '%s\t%s\n' "$appid_target" "$nm" >> "$tmp"
+  else
+    local slugs="" r
+    if [ -z "$want" ] || [ "$want" = all ]; then
+      [ "$action" = install ] && action="list"
+      slugs="$(games_table | cut -f1)"
+    else
+      r="$(resolve_slug "$want")"
+      [ -n "$r" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+      slugs="$r"
+    fi
+    [ -n "$slugs" ] || { warn "还没有装过游戏"; return 0; }
+    for slug in $slugs; do
+      nm="$(mget "$slug" name)"; ap="$(mget "$slug" appid)"
+      [ -n "$ap" ] || continue
+      printf '%s\t%s\n' "$ap" "$nm" >> "$tmp"
+    done
+  fi
   scp -q "${SSH_OPTS[@]}" "$tmp" "$DECK_SSH:/tmp/deckkit-pad-games.tsv" || die "传清单失败"
 
-  if [ "$do_list" = 1 ]; then
+  # 参数一律显式判断（`${x:+--flag}` 对 0/1 开关是错的：0 也是"非空"）
+  local extra="" appid_arg=""
+  [ "$dry" = 1 ] && extra="$extra --dry-run"
+  [ -z "$appid_target" ] || appid_arg="--appid $appid_target"
+  [ -z "$key" ] || extra="$extra --key $key"
+
+  if [ "$action" = list ]; then
     hdr "手柄布局现状"
     rsh "python3 \"$pc\" list --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv"
     dim "  可装模板：mouse（仅鼠标）/ gamepad+mouse / wasd / webbrowser / fps / joystick / touchscreen"
     return 0
   fi
 
-  # 真写：Steam 必须停着（它会回写覆盖）
+  # 真写：Steam 必须停着（它会把这些配置缓存在内存里、退出时回写）
   [ "$dry" = 1 ] || ensure_session
 
-  hdr "安装手柄布局"
-  for slug in $slugs; do
-    ap="$(mget "$slug" appid)"; [ -n "$ap" ] || continue
-    say ""
-    rsh "python3 \"$pc\" $([ "$do_rm" = 1 ] && echo remove || echo install) \
-           --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv --appid \"$ap\" \
-           --template \"$tpl\" ${key:+--key \"$key\"} ${dry:+--dry-run}"
-    n=$((n + 1))
-  done
-  if [ "$do_rm" = 1 ]; then
-    ok "撤掉 $n 个游戏的布局（Steam 里会回到默认）"
+  if [ "$action" = sens ]; then
+    hdr "右摇杆鼠标灵敏度 → ${value}"
   else
-    ok "$n 个游戏写好了（模板 ${tpl}）"
-    dim "  重启 Steam（或切一次 Gaming/桌面模式）后：游戏页面 → 手柄图标 → 看一下布局名"
-    dim "  界面里也能改：想微调就用 Steam 的布局编辑器，改完存成个人布局"
+    hdr "手柄布局：$([ "$action" = remove ] && echo 撤掉 || echo "装 $tpl")"
   fi
+
+  local line
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    ap="${line%%	*}"
+    say ""
+    if [ "$action" = sens ]; then
+      rsh "python3 \"$pc\" sens --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv \
+             --appid \"$ap\" $appid_arg --value \"$value\" $extra"
+    else
+      rsh "python3 \"$pc\" $action --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv \
+             --appid \"$ap\" $appid_arg --template \"$tpl\" $extra"
+    fi
+    n=$((n + 1))
+  done < "$tmp"
+
+  case "$action" in
+    remove) ok "撤掉 $n 个游戏的布局（Steam 里回到默认）" ;;
+    sens)   ok "$n 个游戏的右摇杆鼠标灵敏度改成 ${value}"
+            dim "  重启 Steam（或切一次模式）后生效；觉得太快/太慢就换个数再来一次" ;;
+    *)      ok "$n 个游戏写好了（模板 ${tpl}）"
+            dim "  重启 Steam（或切一次 Gaming/桌面模式）后：游戏页面 → 手柄图标 → 看一下布局名" ;;
+  esac
 }
 
 # ─────────────────────── 交互式游戏管理（TUI）───────────────────────
@@ -1433,6 +1460,7 @@ cmd_help() {
     deck games cover <名字|all>  生成封面写进 Steam 的 grid（装完会自动做；用主程序自带图标）
     deck games fix <名字|all>    维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK（点开始没反应时先跑它）
     deck games pad [<名字|all>]  手柄布局：右摇杆当鼠标等（--list 看现状，--template 选模板）
+                                 也能改 Steam 正版：deck games pad --appid 2739590 -t mouse
 EOF
   dim "  其它：deck games shortcut <名字> 只登记 Steam 条目 / protons / verify；全部：deck games help-all"
 }

@@ -106,3 +106,8 @@ deck files webdav on|off|status
   所以 `mount` 先用 SSH 花 0.2 秒探端口。
 - **共享的是整个家目录**：包括 `~/.ssh`、`~/apps` 等，注意别在 Mac 上误删。
   只想共享子目录就改 `DECK_NFS_DIR`。
+
+- **NFS 属性缓存约 60 秒**：绕过 NFS 直接在 Deck 上写的文件，Mac 侧要过一会儿
+  才看得见。别把它当成「没写进去」；重要判断前先 `stat` 一下。
+- **AppleDouble**：macOS 往 NFS 写文件会顺带生成 `._xxx` 陪衬文件（内核写的，
+  排除列表拦不住）。同步/校验清单时要扫掉，否则会被当成真文件。

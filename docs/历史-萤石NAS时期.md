@@ -400,3 +400,24 @@ IP 可能变了。路由器里找 `MyNAS`，改 `config.env` 的 `NAS_HOST`，�
 rclone purge "ezviz:Public/MacBackup/<主机名>"          # 清空 NAS 上的备份（谨慎！）
 rm -f ~/.config/rclone/rclone.conf                   # 删除凭据
 ```
+
+---
+
+## 附：随 `backup` 服务退役的两条做法
+
+留在 `_archive/` 的代码里，原则本身还有参考价值：
+
+**时钟差法检测休眠**（Deck 上判断「刚从休眠唤醒」）：不要用 D-Bus —— 普通用户订阅
+system bus 会被降级成 eavesdropping，不可靠。用两个时钟的差：
+
+```
+CLOCK_MONOTONIC   休眠时【停走】
+CLOCK_BOOTTIME    休眠时【继续走】
+# 两次采样间若 (ΔBOOTTIME - ΔMONOTONIC) >= 阈值 → 刚醒
+```
+
+纯用户态、零权限。
+
+**请求一律异步 + 并发去重**：Deck 随时可能休眠断网，所以从 Deck 发起的请求只维持到
+「Mac 接受」为止（`--async` 风格开关），真正耗时的活在 Mac 后台跑；入口先拿锁，
+因为开机触发和唤醒触发可能挨得很近。现在还在跑的服务也照这条来。

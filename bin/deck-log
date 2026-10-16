@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# ============================================================
+#  deckkit —— 统一日志入口
+#
+#  为什么要有它：以前日志散在四处、各写各的 —— 菜单栏自己写 menubar.log、
+#  有服务把 node 输出直灌自己的 web 日志、patches 写 installer.log、
+#  games 写 install.log。位置不同、格式不同、有的永不轮转（65KB 还在涨）。
+#  排查时第一件事变成「先找日志在哪」，而不是看问题。
+#
+#  用法：
+#    deck-log <来源> <消息...>       追加一条（自动加时间戳、压成一行）
+#    deck-log <来源> <<'EOF' ...     从 stdin 逐行收录
+#    deck-log --path <来源>          打印日志文件路径（给要直接重定向的服务）
+#    deck-log --rotate <来源> [代数]  轮转：当前日志挪成 .1（流式日志启动时调）
+#    deck-log --list                 列出本机所有日志源
+#    deck-log --dir                  打印日志目录
+#
+#  位置（DECKKIT_LOG_DIR 可覆盖）：
+#    Mac   ~/Library/Logs/deckkit/<来源>.log
+#    Deck  ~/deckkit/logs/<来源>.log
+#
+#  收录标准见 docs/约定.md 的「日志」一节，一句话：
+#  **只记对 debug 有用的东西** —— 状态变化、失败原因、用户动作、生命周期锚点；
+#  不记正常心跳、不记数字波动、不记随时能重算出来的东西。
+# ============================================================
+set -uo pipefail
+
+C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
+C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+if [ ! -t 1 ]; then C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; fi
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s!%s %s\n' "$C_YEL" "$C_RST" "$*" >&2; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_RST" "$*" >&2; exit 1; }
+
+# ── 位置 ──
+log_dir() {
+  if [ -n "${DECKKIT_LOG_DIR:-}" ]; then printf '%s' "$DECKKIT_LOG_DIR"; return 0; fi
+  # Deck 是 Linux，Mac 是 Darwin —— 两边的「正确位置」不一样：
+  # Mac 上日志该在 ~/Library/Logs（系统惯例、访达能直接翻），
+  # Deck 上放 ~/deckkit/logs，和 ~/deckkit/services 对称。
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '%s' "${HOME}/Library/Logs/deckkit"
+  else
+    printf '%s' "${HOME}/deckkit/logs"
+  fi
+}
+
+# 来源名规范化：只留 [a-z0-9-]。防的是 `..` 之类跑出日志目录，
+# 顺带让「来源」在文件名里始终长得一样（菜单栏、<服务>-web …）。
+log_slug() {
+  printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]' \
+    | sed 's/[^a-z0-9-]/-/g; s/--*/-/g; s/^-//; s/-$//'
+}
+
+log_file() { printf '%s/%s.log' "$(log_dir)" "$(log_slug "${1:-}")"; }
+
+# 单行化：日志一行一条才好 grep。换行/回车/tab 压平，超长截断。
+log_flatten() {
+  printf '%s' "${1:-}" | tr '\n\r' '  ' | tr '\t' ' ' \
+    | cut -c1-"${DECKKIT_LOG_MAX_CHARS:-800}"
+}
+
+# ── 滚动 ──
+# 事件型日志（经本工具写入）按**行数**封顶：超了丢最旧的。
+# 默认 100 行 —— 事件是稀疏的（只记状态变化），100 条能覆盖很久；
+# 流式日志（node/proton 的原始输出）不走这里，靠 --rotate 轮转。
+trim_file() {
+  local f="$1" max="${DECKKIT_LOG_MAX_LINES:-100}" n tmp
+  [ -f "$f" ] || return 0
+  n="$(wc -l < "$f" 2>/dev/null | tr -d ' ')"
+  case "${n:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$n" -gt "$max" ] || return 0
+  tmp="${f}.tmp.$$"
+  # 先写临时文件再 mv：直接在原文件上截断，正在 tail -f 的进程会看到半截。
+  if tail -n "$max" "$f" > "$tmp" 2>/dev/null; then mv -f "$tmp" "$f"; else rm -f "$tmp"; fi
+}
+
+append_line() {   # $1=来源 $2=消息（已单行化）
+  local f; f="$(log_file "$1")"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || die "建不了日志目录：$(dirname "$f")"
+  printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$2" >> "$f" || die "写不进去：$f"
+  trim_file "$f"
+}
+
+rotate_file() {   # $1=来源 $2=保留代数（默认 1）
+  local f keep i; f="$(log_file "$1")"; keep="${2:-1}"
+  case "${keep:-}" in ''|*[!0-9]*) keep=1 ;; esac
+  [ -f "$f" ] || return 0
+  i="$keep"
+  while [ "$i" -ge 1 ]; do
+    if [ "$i" -eq 1 ]; then
+      mv -f "$f" "${f}.1"
+    elif [ -f "${f}.$((i - 1))" ]; then
+      mv -f "${f}.$((i - 1))" "${f}.${i}"
+    fi
+    i=$((i - 1))
+  done
+}
+
+list_sources() {
+  local d; d="$(log_dir)"
+  if [ ! -d "$d" ]; then warn "还没有日志目录：${d}"; return 0; fi
+  say "${C_B}日志目录${C_RST}  ${d}"
+  say ""
+  printf '  %-22s %8s  %s\n' "来源" "大小" "最后一条"
+  local f base size last
+  for f in "$d"/*.log; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f" .log)"
+    size="$(du -h "$f" 2>/dev/null | cut -f1)"
+    # 流式日志（node/proton 的原始输出）带 ANSI 控制序列，直接显示会把终端搞花
+    # —— 实测 node 结尾那行是 `\033[?25h`（恢复光标），所以字符类里必须有 `?`，
+    # 只写 `[0-9;]` 匹配不到它。
+    # 剥完经常是空行（那行本来就只有控制序列）→ 往上找第一条真有内容的。
+    last="$(tail -n 1 "$f" 2>/dev/null | sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | tr -d '\r')"
+    if [ -z "${last// /}" ]; then
+      last="$(tail -n 30 "$f" 2>/dev/null \
+        | sed $'s/\033\\[[0-9;?]*[A-Za-z]//g' | tr -d '\r' \
+        | grep -v '^[[:space:]]*$' | tail -n 1)"
+    fi
+    # cut -c 在 macOS 上按**字符**切，所以中文不会被截成半个字。
+    printf '  %-22s %8s  %s\n' "$base" "${size:-?}" "$(printf '%s' "$last" | cut -c1-46)"
+  done
+  say ""
+  say "${C_DIM}读：deck logs [来源|all]   跟：deck logs -f <来源>${C_RST}"
+  say "${C_DIM}Deck 侧的来源（patches-installer、games-install）不在这个目录里 ——"
+  say "直接 deck logs <来源>，本地没有它会去 Deck 上取${C_RST}"
+}
+
+usage() {
+  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-}" in
+  -h|--help|help|"")
+    usage ;;
+  --dir)
+    log_dir; echo ;;
+  --path)
+    [ $# -ge 2 ] || die "用法：deck-log --path <来源>"
+    log_file "$2"; echo ;;
+  --rotate)
+    [ $# -ge 2 ] || die "用法：deck-log --rotate <来源> [代数]"
+    rotate_file "$2" "${3:-1}"
+    say "${C_GRN}✓${C_RST} 已轮转：$(log_file "$2")"
+    ;;
+  --list)
+    list_sources ;;
+  --trim)
+    [ $# -ge 2 ] || die "用法：deck-log --trim <来源>"
+    trim_file "$(log_file "$2")" ;;
+  -*)
+    die "不认识的选项：$1（-h 看用法）" ;;
+  *)
+    src="$(log_slug "$1")"; shift
+    [ -n "$src" ] || die "来源名不能为空（只允许字母数字和连字符）"
+    if [ $# -gt 0 ]; then
+      append_line "$src" "$(log_flatten "$*")"
+    else
+      # 没给消息就从 stdin 逐行收录（空行丢掉：日志里空行没有信息量）
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        append_line "$src" "$(log_flatten "$line")"
+      done
+    fi
+    ;;
+esac

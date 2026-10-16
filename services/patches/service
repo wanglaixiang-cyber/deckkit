@@ -8,115 +8,136 @@
 #    deck patches add <补丁.exe|文件夹>   解包 → 推断目标游戏（--game 指定）→ 传到 Deck 入库
 #    deck patches add <补丁.exe> --installer [--game 游戏]
 #                                        「带安装器的补丁」：用游戏自己的 prefix 拉起向导，
-#                                        安装前后对游戏目录做快照，记下改了哪些文件（未实测）
+#                                        安装前后对游戏目录做快照，记下改了哪些文件
+#                                        （这条路代码已就绪，但真实样本还没验收过）
 #    deck patches mount <补丁>           挂载（覆盖游戏文件；**不备份**原文件）
 #    deck patches unmount <补丁>         告诉你还原办法（本地没有备份可还原）
 #    deck patches toggle <补丁>          切换挂载/卸载（菜单栏点一下走它）
 #    deck patches verify <补丁>          md5 逐文件核对
 #    deck patches remove|rm <补丁>       从库里删除（会先要求卸载）
-#    deck patches menu                   给菜单栏用的行（框架约定 §2.1）
-#    deck patches install                在 Deck 上准备补丁库 + 装 Deck 侧脚本
+#    deck patches mount-file <补丁.exe>  点菜单栏那条：先分诊 → 自己找游戏 → 入库 → 挂载
+#    deck patches menu                   给菜单栏用的行（原样转发 Deck 侧 patchctl.sh menu）
+#    deck patches install                在 Deck 上准备补丁库 + 推 Deck 侧脚本与公共库
 #
 #  处理的是「文件包」型补丁：解包成文件清单，再按相对路径覆盖进游戏目录。
 #  为什么不直接跑补丁 exe：它的安装脚本会把目标算成
 #  %ProgramFilesFolder%\Steam\steamapps\common\<游戏>（Proton prefix 里的假路径），
 #  直接跑会装进 prefix 而游戏目录毫无变化 —— 详见 SERVICE.md。
-#  「带安装器的补丁」是另一类，目前没有自动化（也还没实测过），见 SERVICE.md 已知边界。
+#  「带安装器的补丁」（--installer）是另一条路：解不出清单，只能真把向导跑起来，
+#  用**游戏自己的 prefix**，安装前后对游戏目录做快照对比 —— 见 SERVICE.md 那一节。
 #
 #  解包在 Mac 上做（sfextract / innoextract / 7z），Deck 上**不缓存**解包结果和 exe：
 #  挂载时临时传一次，挂完即删（KEEP_*=yes 才留）。状态靠 md5 算，所以 Steam 校验完整性
 #  之后状态自己变回「未挂载」，再选一次补丁 exe 就能重挂。
+#
+#  公共件（配置/颜色/ssh/slug/usage）都在 bin/deck-lib，见 docs/约定.md §1。
 # ============================================================
 set -uo pipefail
 
 SVC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_DIR="${SVC_DIR}/mac"
 DECK_DIR="${SVC_DIR}/deck"
+ROOT_DIR="$(cd "$SVC_DIR/../.." && pwd)"
+DECKKIT_ROOT="$ROOT_DIR"
+. "$ROOT_DIR/bin/deck-lib"
 
-cfg_get() { sed -n "s/^$1=[\"']\{0,1\}\([^\"'#]*\).*/\1/p" "$MAC_DIR/config.env" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
-
-DECK_SSH="$(cfg_get DECK_SSH)";             DECK_SSH="${DECK_SSH:-deck}"
-DECK_HOST="$(cfg_get DECK_HOST)";           DECK_HOST="${DECK_HOST:-steamdeck.local}"
-DECK_PATCH_ROOT="$(cfg_get DECK_PATCH_ROOT)"; DECK_PATCH_ROOT="${DECK_PATCH_ROOT:-~/deckkit/services/patches}"
-DECK_HOME="$(cfg_get DECK_HOME)"; DECK_HOME="${DECK_HOME:-/home/deck}"
+DECK_SSH="$(deckkit_cfg_or DECK_SSH deck)"
+DECK_HOST="$(deckkit_cfg_or DECK_HOST steamdeck.local)"
+DECK_PATCH_ROOT="$(deckkit_cfg_or DECK_PATCH_ROOT '~/deckkit/services/patches')"
+DECK_HOME="$(deckkit_cfg_or DECK_HOME /home/deck)"
 # 传给 Deck 的**文件路径一律用绝对路径**：远端引号里的 ~ 不展开（`#~/` 这种还踩过
 # bash 把模式里的 ~ 也展开的坑），而且 pctl 用 printf %q 引用参数时 ~ 会被包进
 # $'...' 里，一样不展开 —— 实测「找不到安装器：~/deckkit/...」就是这么来的。
+# 注意：config.env 的 DECK_PATCH_ROOT **真的生效**（以前这里硬编码 ~/deckkit/...，
+# 等于把它架空），所有远端路径都由 DECK_PATCH_ABS 拼出来。
 DECK_PATCH_ABS="$DECK_PATCH_ROOT"
 case "$DECK_PATCH_ROOT" in "~/"*) DECK_PATCH_ABS="$DECK_HOME/${DECK_PATCH_ROOT#\~/}" ;; esac
-KEEP_PAYLOAD="$(cfg_get KEEP_PAYLOAD_ON_DECK)"; KEEP_PAYLOAD="${KEEP_PAYLOAD:-no}"
-KEEP_INSTALLER="$(cfg_get KEEP_INSTALLER_ON_DECK)"; KEEP_INSTALLER="${KEEP_INSTALLER:-no}"
-SSH_TIMEOUT="$(cfg_get SSH_TIMEOUT)";       SSH_TIMEOUT="${SSH_TIMEOUT:-10}"
+KEEP_PAYLOAD="$(deckkit_cfg_or KEEP_PAYLOAD_ON_DECK no)"
+KEEP_INSTALLER="$(deckkit_cfg_or KEEP_INSTALLER_ON_DECK no)"
+SSH_TIMEOUT="$(deckkit_cfg_or SSH_TIMEOUT 10)"
+deckkit_ssh_init
 
-WORK_DIR="${HOME}/Library/Application Support/deckkit/patches"
-mkdir -p "$WORK_DIR" 2>/dev/null
-
-if [ -t 1 ]; then
-  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
-  C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
-else
-  C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""
-fi
-say()  { printf '%s\n' "$*"; }
-hdr()  { printf '\n%s%s%s\n' "$C_B" "$*" "$C_RST"; }
-dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST"; }
-ok()   { printf '  %s\xe2\x9c\x93%s %s\n' "$C_GRN" "$C_RST" "$*"; }
-warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RST" "$*"; }
-bad()  { printf '  %s\xe2\x9c\x97%s %s\n' "$C_RED" "$C_RST" "$*"; }
-die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
-
-# SSH 连接复用（约定 §3）：一轮刷新要问 Deck 好几次，不复用每次都重新握手
-SSH_MUX=(-o ControlMaster=auto -o ControlPath="$HOME/.ssh/deckkit-cm-%r@%h:%p" -o ControlPersist=15s)
-SSH_OPTS=(-o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SSH_MUX[@]}")
-
-rsh() { ssh "${SSH_OPTS[@]}" "$DECK_SSH" "$@"; }
-
-# 远端脚本 + 位置参数（参数由本地 shell 安全引用）
-rsh_script() {
-  local args="" a
-  for a in "$@"; do args="$args $(printf '%q' "$a")"; done
-  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "bash -s --$args"
+# cmd_add 的临时目录。**必须是全局变量**：EXIT trap 在函数返回之后才跑，
+# 用函数里的 local 只会拿到空值（bash 3.2 的 trap 语义）。
+WORK_TMP=""
+cleanup_work() {
+  if [ -n "${WORK_TMP:-}" ]; then rm -rf "$WORK_TMP"; fi
+  return 0
 }
-
-DECK_TOOL="$DECK_PATCH_ROOT/patchctl.sh"
-deck_up() { rsh true >/dev/null 2>&1; }
-require_deck() { deck_up || die "Deck（${DECK_HOST}）连不上 —— 确认开机、SSH 打开、同一网段"; }
-
-# 在 Deck 上跑 patchctl（把 ~ 换成 $HOME，因为引号里的 ~ 不会展开）
-pctl() {
-  local args="" a
-  for a in "$@"; do args="$args $(printf '%q' "$a")"; done
-  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "PATCH_ROOT=\"\${HOME}/deckkit/services/patches\" bash \"\${HOME}/deckkit/services/patches/patchctl.sh\"$args"
-}
+# 中途任何 die / Ctrl-C 都走到这里：不留临时目录、也不留半截状态
+trap cleanup_work EXIT
 
 # ------------------------------------------------------------- 工具函数 ---
-# 补丁名 → 短名（Deck 上的目录名）。和 games 那边同一个规则：保留 \w（含中日文），
-# 因为汉化补丁的文件名经常整段是中文（"MyGame2 汉化补丁.exe"），
-# 老规则只留 [a-z0-9] 会把它削成空字符串、只能逼人 --name。
-slugify() {
-  python3 -c '
-import re, sys
-s = re.sub(r"\.exe$", "", sys.argv[1], flags=re.I).lower()
-print(re.sub(r"[^\w]+", "-", s, flags=re.U).strip("-_")[:48])
-' "$1"
+# 连不上 Deck 的报错用 mDNS 名字（比 ssh 别名好认）
+deck_required() { require_deck "Deck（${DECK_HOST}）连不上 —— 确认开机、SSH 打开、同一网段"; }
+
+# 在 Deck 上跑 patchctl.sh。
+#   · 参数走 deckkit_quote_args：$id/$name 里可能有空格/分号，直接拼进远端命令串
+#     等于把远端命令的执行权交给输入（review 抓到）。
+#   · PATCH_ROOT 显式传 DECK_PATCH_ABS，和 config.env 一致。
+pctl() {
+  local args; args="$(deckkit_quote_args "$@")"
+  ssh "${SSH_OPTS[@]}" "$DECKKIT_SSH_TARGET" \
+    "PATCH_ROOT=$(printf '%q' "$DECK_PATCH_ABS") bash $(printf '%q' "$DECK_PATCH_ABS/patchctl.sh")$args"
 }
 
-human() { # 字节 → 人类可读
-  local b="${1:-0}"
-  awk -v b="$b" 'BEGIN{ split("B KiB MiB GiB TiB",u," "); i=1; while (b>=1024 && i<5){b/=1024;i++} printf (i==1?"%d %s":"%.1f %s"), b, u[i] }'
+# 远端「路径存在吗」；远端路径一律 %q 引用，且只传 $DECK_PATCH_ABS 下的绝对路径。
+rsh_test_d() { rsh "test -d $(printf '%q' "$1")"; }
+rsh_test_e() { rsh "test -e $(printf '%q' "$1")"; }
+
+# 上传走公共库的 rsh_put（同一个「先临时文件再 mv」的写法，bin/deck push 也用）。
+
+# 取补丁列表（<id>\t<游戏>\t<状态>\t<内部状态>\t<文件数>）。
+#   · pctl 失败 = 远端真出错 → 直接 die，别当成「库是空的」（review 抓到过这种误报）
+#   · 只认带 tab 的行：patchctl list 在库不存在时会打一行人类提示
+#     `(补丁库是空的)`，旧写法 `grep -c .` 会把它数成「1 个补丁」
+pctl_list() {
+  local raw
+  raw="$(pctl list)" || return 1
+  printf '%s\n' "$raw" | awk -F'\t' 'NF>=5'
 }
 
-# 补丁 id（appid/slug）→ 远端目录
+# 补丁 id（appid/slug）→ 远端目录。
+#   返回 1 = 没匹配上、或匹配到多个（调用方给「找不到」的提示）
+#   返回 2 = **远端出错**（列不出库）—— 以前两种情形共用一条 return 1，
+#            「连不上」会被说成「库里没有」。
+# 注意：这个函数在 `$( )` 里被调用，所以里面**不能 die**（只结束子 shell）。
 patch_dir_of() {
-  local id="$1"
+  local id="$1" raw hit n
   case "$id" in
-    */*) printf '%s/store/%s' "$DECK_PATCH_ABS" "$id" ;;
-    *)   # 只给了 slug：让 Deck 侧找唯一匹配
-         local hit
-         hit="$(pctl list | awk -F'\t' -v s="$id" '$1 ~ ("/" s "$") {print $1}')"
-         [ "$(printf '%s\n' "$hit" | grep -c .)" = "1" ] || return 1
-         printf '%s/store/%s' "$DECK_PATCH_ABS" "$hit" ;;
+    */*) printf '%s/store/%s' "$DECK_PATCH_ABS" "$id"; return 0 ;;
   esac
+  raw="$(pctl_list)" || return 2
+  hit="$(printf '%s\n' "$raw" | awk -F'\t' -v s="$id" '$1 ~ ("/" s "$") {print $1}')"
+  n="$(printf '%s\n' "$hit" | grep -c .)"
+  [ "$n" = "1" ] || return 1
+  printf '%s/store/%s' "$DECK_PATCH_ABS" "$hit"
+}
+
+# 入库前先看库里有没有同 id 的记录。
+# 以前是直接 mkdir -p + 覆盖写：同名（slug 相同）但来源不同的补丁会把前一份的
+# manifest/meta **静默吃掉**（review 抓到 —— 丢记录比报错难查得多）。
+guard_existing() {   # <rdir> <force 0|1> [same_kind：同名记录是这个 kind 就放过]
+  local rdir="$1" force="${2:-0}" same_kind="${3:-}"
+  rsh_test_e "$rdir" || return 0
+  # 「同一条记录的重新走一遍」不算覆盖别人的东西：安装器型补丁再跑一次向导时，
+  # manifest 本来就该被这次安装的结果替换掉（SERVICE.md 的「重装：再跑一次同一条命令」）。
+  if [ -n "$same_kind" ] && [ "$(pctl kind "$rdir" 2>/dev/null)" = "$same_kind" ]; then
+    return 0
+  fi
+  if [ "$force" != "1" ]; then
+    die "库里已经有同名的补丁：${rdir#${DECK_PATCH_ABS}/store/}
+       继续就会覆盖它（旧记录的 manifest/meta 会丢）。确认要覆盖再加 --force：
+         deck patches add '<补丁>' --force [--game <游戏>]"
+  fi
+  # §6 第一道阀：只允许删 store/<appid>/<补丁> 这一层
+  case "$rdir" in
+    "$DECK_PATCH_ABS"/store/?*/?*) ;;
+    *) die "拒绝删除：路径结构不是 store/<appid>/<补丁>（${rdir}）" ;;
+  esac
+  case "$rdir" in *..*) die "拒绝删除：路径里有 ..（${rdir}）" ;; esac
+  warn "库里已有同名补丁，按 --force 覆盖（先删掉旧记录）"
+  rsh "rm -rf $(printf '%q' "$rdir")" || die "删不掉旧记录：$rdir"
 }
 
 # ------------------------------------------------ 安装器型补丁（⚠️ 未实测）--
@@ -127,7 +148,7 @@ patch_dir_of() {
 # 会话准备和 games 那边**不一样**：补丁不写 shortcuts.vdf，所以不用退 Steam、
 # 不用等它把文件写完 —— 只要在桌面模式（向导要开窗）就够了。
 ensure_desktop() {
-  require_deck
+  deck_required
   # 查两次：实测出现过一次假阴性（明明在桌面模式却报了要切换）。
   # 这个方向是安全的 —— 已经切过去时 steamosctl 什么也不做 —— 但多查一次就不吵了。
   local k
@@ -154,10 +175,28 @@ ensure_desktop() {
 #   · 共享一段 ≥2 字的日文/中文（MyGame3…）  +3
 # 只在「最高分 > 0 且严格高过第二名」时采用；否则要求 --game。
 # 猜中也只是猜 —— 调用方会把结果打印出来并提示怎么覆盖。
+#
+# 退出码（**分开是必需的**）：
+#   0 = 命中一个    1 = 文件名看不出目标    2 = 命中多个   3 = --game 给的名字没有匹配
+#   4 = **列不出 Deck 上的游戏**（ssh / patchctl 失败）
+# 以前 3 同时表示「列不出」和「没有这个游戏」，调用方于是把连不上报成
+# 「没有叫 x 的游戏」—— 假结论，会把人引去重装/重命名。
 game_from_name() {
-  local pname="$1" want="${2:-}"
-  pctl games > "$WORK_DIR/games.tsv" 2>/dev/null || return 3
-  PNAME="$pname" WANT="$want" GAMES_TSV="$WORK_DIR/games.tsv" python3 - <<'PY'
+  local pname="$1" want="${2:-}" gtsv rc=0
+  # 唯一临时名：以前是固定名（应用支持目录里一个 games.tsv、Deck 上
+  # /tmp/deckkit-patch-*.tsv），并发两次 add 会互相覆盖对方的文件（review 抓到）。
+  # 诊断信息走 **stderr**：这个函数的结果总被 `row="$(game_from_name ...)"` 接走，
+  # 打到 stdout 会被当成"游戏行"一起捕获（rc=4 时虽然没人用 row，但没必要留这个坑）。
+  if ! gtsv="$(mktemp "${TMPDIR:-/tmp}/deckkit-games.XXXXXX")"; then
+    printf '  ! 建不了临时文件（TMPDIR=%s）\n' "${TMPDIR:-/tmp}" >&2
+    return 4
+  fi
+  if ! pctl games > "$gtsv"; then
+    printf '  ✗ 列不出 Deck 上的游戏（ssh / patchctl 的报错见上）\n' >&2
+    rm -f "$gtsv"
+    return 4
+  fi
+  PNAME="$pname" WANT="$want" GAMES_TSV="$gtsv" python3 - <<'PY' || rc=$?
 import os, re, sys
 pname = os.environ["PNAME"].lower()
 want = os.environ.get("WANT", "")
@@ -192,17 +231,19 @@ if len(ranked) > 1 and ranked[1][0] == ranked[0][0]:
     sys.exit(2)
 print("\t".join(ranked[0][1]))
 PY
+  rm -f "$gtsv"
+  return $rc
 }
 
-cmd_add_installer() {
-  local exe="$1" want="$2" name="$3"
-  require_deck
+cmd_add_installer() {   # <exe> <want> <name> <force 0|1>
+  local exe="$1" want="$2" name="$3" force="${4:-0}"
+  deck_required
   [ -f "$exe" ] || die "找不到文件：$exe"
   local base; base="$(basename "$exe")"
-  [ -n "$name" ] || name="$(slugify "$base")"
+  [ -n "$name" ] || name="$(deckkit_slug "$base" 48)"
   [ -n "$name" ] || die "无法从文件名推断短名，用 --name 指定"
 
-  hdr "安装器型补丁（这条路还没实测过：第一次用请盯着下面的输出）"
+  hdr "安装器型补丁（这条路真实样本还没验收过：第一次用请盯着下面的输出）"
   dim "  安装器 ${base}"
 
   local row rc=0
@@ -211,6 +252,7 @@ cmd_add_installer() {
     0) ;;
     1) die "补丁文件名里看不出目标游戏 —— 用 --game 指定：deck patches games 看有哪些" ;;
     2) die "补丁文件名匹配到多个游戏 —— 用 --game 指定：deck patches games 看有哪些" ;;
+    4) die "列不出 Deck 上的游戏（原始报错见上）—— 这一条不是「没有这个游戏」" ;;
     *) die "没有叫「${want}」的游戏（deck patches games 看有哪些）" ;;
   esac
   local appid gname gdir
@@ -224,29 +266,55 @@ cmd_add_installer() {
 
   ensure_desktop
   local rdir="$DECK_PATCH_ABS/store/$appid/$name"
-  rsh "mkdir -p \"\${HOME}/deckkit/services/patches/store/$appid/$name\"" || die "Deck 上建目录失败"
+  # 同名记录：同是安装器型（重跑向导）放过；别的类型 → 默认拒绝，避免把文件包型
+  # 那份 manifest 覆盖掉。
+  guard_existing "$rdir" "$force" installer
+  rsh "mkdir -p $(printf '%q' "$rdir")" || die "Deck 上建目录失败：$rdir"
   say "${C_DIM}==> 上传补丁安装器（临时：装完按配置删）${C_RST}"
-  rsync -a "$exe" "$DECK_SSH:$rdir/patch.exe" || die "上传失败"
+  rsync -a "$exe" "$DECK_SSH:$rdir/patch.exe" || die "上传安装器失败"
 
   hdr "安装前快照"
-  rsh "bash \"\${HOME}/deckkit/services/patches/patchctl.sh\" snapshot '$gdir' > \"\${HOME}/deckkit/services/patches/store/$appid/$name/before.tsv\"" \
-    || die "快照失败"
-  local n_all
-  n_all="$(rsh "wc -l < \"\${HOME}/deckkit/services/patches/store/$appid/$name/before.tsv\"" | tr -d ' ')"
+  # 快照在本地生成、再传上去。**不能**再写成
+  # `rsh "patchctl.sh snapshot ... > 远端文件"`：那个写法里退出码来自管道的
+  # sort（恒为 0），`|| die "快照失败"` 永远不触发 —— 空快照会被后面的
+  # 「整目录对比」当成「安装前后一个文件都没变」，把失败报成「安装器没装进去」。
+  # 本地临时文件统一放 WORK_TMP（EXIT trap 负责清）；这条路可能在 cmd_add 里
+  # 还没建过它（--installer 分支在 cmd_add 建临时目录之前），所以这里自己补。
+  if [ -z "$WORK_TMP" ]; then
+    if ! WORK_TMP="$(mktemp -d "${TMPDIR:-/tmp}/deckkit-patch.XXXXXX")"; then
+      WORK_TMP=""
+      die "建不了临时目录（TMPDIR=${TMPDIR:-/tmp}）"
+    fi
+  fi
+  local before_local="$WORK_TMP/before.tsv"
+  if ! pctl snapshot "$gdir" > "$before_local"; then
+    rm -f "$before_local"
+    die "安装前快照失败（远端报错见上）：$gdir —— 没有快照就没法比对安装结果，先解决这一条"
+  fi
+  local n_all; n_all="$(grep -c . "$before_local")"
+  rsh_put "$before_local" "$rdir/before.tsv" || die "上传快照失败：$rdir/before.tsv"
+  rm -f "$before_local"
   dim "  ${gdir}：${n_all} 个文件"
 
-  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/patches/store/$appid/$name/meta.tsv\"" <<EOF
-name=$name
-kind=installer
-appid=$appid
-game=$gname
-dir=$gdir
-orig=$base
-sha256=$sha
-added_at=$(date '+%Y-%m-%d %H:%M:%S')
-EOF
-  rsh "printf 'name=%s\ndir=%s\nkind=installer\n' '$gname' '$gdir' > \"\${HOME}/deckkit/services/patches/store/$appid/.game\"" \
-    || die "写 .game 失败"
+  local meta_local="$WORK_TMP/meta.tsv"
+  {
+    printf 'name=%s\n' "$name"
+    printf 'kind=installer\n'
+    printf 'appid=%s\n' "$appid"
+    printf 'game=%s\n' "$gname"
+    printf 'dir=%s\n' "$gdir"
+    printf 'orig=%s\n' "$base"
+    printf 'sha256=%s\n' "$sha"
+    printf 'added_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$meta_local" || die "写不了本地临时文件：$meta_local"
+  rsh_put "$meta_local" "$rdir/meta.tsv" || die "上传 meta 失败"
+  rm -f "$meta_local"
+
+  rsh_script "$DECK_PATCH_ABS" "$appid" "$gname" "$gdir" <<'REMOTE' || die "写 .game 失败"
+root="$1"; appid="$2"; name="$3"; dir="$4"
+mkdir -p "$root/store/$appid" || exit 1
+printf 'name=%s\ndir=%s\nkind=installer\n' "$name" "$dir" > "$root/store/$appid/.game"
+REMOTE
   ok "记录已写入（kind=installer）"
 
   local started; started="$(date '+%s')"
@@ -258,27 +326,44 @@ EOF
 
   hdr "安装结果"
   local res n b
-  res="$(pctl manifest-from-install "$rdir" "$gdir" "$rdir/before.tsv" "$started" 2>/dev/null || true)"
+  # 失败**必须**直接报错：以前是 `2>/dev/null || true`，远端一失败 res 就是空的，
+  # 于是走「一个文件都没变」那个分支 —— 把执行失败报成「安装器没把文件装进去」。
+  if ! res="$(pctl manifest-from-install "$rdir" "$gdir" "$rdir/before.tsv" "$started")"; then
+    die "生成清单失败（远端报错见上）。记录和 before.tsv 都还在 Deck 上：deck patches rm <补丁> --yes 可以清掉"
+  fi
   n="$(printf '%s' "$res" | cut -f1)"; b="$(printf '%s' "$res" | cut -f2)"
-  rsh "rm -f \"\${HOME}/deckkit/services/patches/store/$appid/$name/before.tsv\"" 2>/dev/null
+  if ! rsh "rm -f $(printf '%q' "$rdir/before.tsv")"; then
+    warn "删不掉 Deck 上的 before.tsv（留着不影响使用）：$rdir/before.tsv"
+  fi
   if [ "${n:-0}" = 0 ]; then
-    warn "游戏目录里一个文件都没变 —— 安装器大概装到别处去了"
-    dim "  常见原因：它把 %ProgramFilesFolder% 当成游戏目录（那是 prefix 里的假路径）"
-    dim "  办法：在向导里手动把路径指到 ${gdir}（Proton 下是 Z: 开头的同一个目录）"
-    dim "  安装器日志在 Deck 上：~/deckkit/services/patches/installer.log（tail -40 看）"
+    warn "游戏目录里一个文件都没变 —— 安装器没有把文件装进去"
+    dim "  按可能性从高到低排查："
+    dim "   ① 向导里的**安装目录是空的 / 没填**（实测最常踩）—— 要手填这个路径："
+    dim "        ${gdir}"
+    dim "      Proton 下同一个目录就是 Z: 开头那条，例如："
+    dim "        Z:${gdir}"
+    dim "   ② 它默认指向 %ProgramFilesFolder%（prefix 里的假路径，不是真实游戏目录）—— 同样手动改到上面那条"
+    dim "   ③ 向导没走完（没点 Finish / 中途关窗）"
+    say ""
+    dim "  安装器日志（里面常有它到底写到哪去了）："
+    dim "    deck logs patches-installer"
     dim "  记录先留着（status 会显示「未挂载」）；确认没用可以 deck patches rm $appid/$name --yes"
+    dim "  重装：再跑一次同一条命令（安装器型不留缓存，会重新上传并开向导）"
   else
-    ok "被动过、且内容真的变了：${n} 个文件 / $(human "$b")"
-    pctl list | awk -F'\t' -v want="$appid/$name" '$1==want {printf "  状态 %s · %s 个文件\n", $3, $5}'
+    ok "被动过、且内容真的变了：${n} 个文件 / $(deckkit_human "$b")"
+    pctl_list | awk -F'\t' -v want="$appid/$name" '$1==want {printf "  状态 %s · %s 个文件\n", $3, $5}'
   fi
   local done_msg="入库完成"
-  [ "${n:-0}" = 0 ] && done_msg="记录写了，但没有文件变化" 
+  [ "${n:-0}" = 0 ] && done_msg="记录写了，但没有文件变化"
 
   if [ "$KEEP_INSTALLER" = "yes" ]; then
     dim "  安装器留在 Deck（KEEP_INSTALLER_ON_DECK=yes）"
   else
-    rsh "rm -f \"\${HOME}/deckkit/services/patches/store/$appid/$name/patch.exe\"" 2>/dev/null
-    dim "  已删掉 Deck 上的安装器副本（按配置不留）—— 要重装就再从 Mac 跑一次这条命令"
+    if rsh "rm -f $(printf '%q' "$rdir/patch.exe")"; then
+      dim "  已删掉 Deck 上的安装器副本（按配置不留）—— 要重装就再从 Mac 跑一次这条命令"
+    else
+      warn "删不掉 Deck 上的安装器副本：$rdir/patch.exe"
+    fi
   fi
   ok "${done_msg}：$appid/$name"
 }
@@ -287,29 +372,47 @@ EOF
 # 目标推断：把补丁里的相对路径拿去和每个游戏目录比对，命中最多者胜
 infer_game() {
   local rels="$1" want="${2:-}"
-  # 路径清单不能走 stdin：那条通道被 heredoc（远端脚本本体）占着。
-  # 先 scp 到 /tmp，远端脚本再去读。
-  scp -q "${SSH_OPTS[@]}" "$rels" "$DECK_SSH:/tmp/deckkit-patch-paths.txt" || return 1
-  rsh_script "$want" <<'REMOTE'
-want="$1"
+  # 路径清单不能走 stdin：那条通道被 heredoc（远端脚本本体）占着。先 scp 到 /tmp。
+  # 临时名带 $tag：以前是固定名 /tmp/deckkit-patch-*.tsv —— 并发两次 add 会互相
+  # 覆盖对方的文件，而且永远不会被删。现在名字唯一，远端脚本自己 trap 收拾。
+  local tag; tag="$$-${RANDOM}"
+  scp -q "${SSH_OPTS[@]}" "$rels" "$DECK_SSH:/tmp/deckkit-patch-$tag-paths.txt" || return 1
+  rsh_script "$want" "$tag" <<'REMOTE'
+want="$1"; tag="$2"
+paths="/tmp/deckkit-patch-$tag-paths.txt"
+cands="/tmp/deckkit-patch-$tag-games.tsv"
+scores="/tmp/deckkit-patch-$tag-scores.tsv"
+trap 'rm -f "$paths" "$cands" "$scores"' EXIT
+
 root="$HOME/.steam/steam"
 libs="$( { sed -n 's/.*"path"[[:space:]]*"\(.*\)".*/\1/p' "$root/steamapps/libraryfolders.vdf" 2>/dev/null
-          printf '%s\n' "$root"; } | while read -r p; do readlink -f "$p"; done | sort -u )"
-mapfile -t rels < /tmp/deckkit-patch-paths.txt
+          printf '%s\n' "$root"; } | while IFS= read -r p; do readlink -f "$p"; done | sort -u )"
+mapfile -t rels < "$paths"
+
+# 兼容层不是游戏。**这套模式串和 patchctl.sh 的 is_runtime 逐字相同** ——
+# 同一条规则两处实现，改这里就要改那里（以前这边写 *Steamworks*、那边写两条全称，
+# 规则已经分叉过一次）。
+is_runtime() {
+  case "$1" in
+    *Proton*|*SteamLinuxRuntime*|*"Steam Linux Runtime"*|*"Steamworks Common Redistributables"*|*"Steamworks Shared"*) return 0 ;;
+  esac
+  return 1
+}
 
 # 候选游戏目录两个来源，先都收集成「appid \t 名字 \t 目录」，后面统一打分：
 #   ① Steam 游戏（appmanifest_*.acf）
 #   ② deckkit games 自己装的非 Steam 游戏（免安装 = 游戏目录；装 exe 的 = prefix 里主程序那一层）
 #      —— 补丁同样要能打到它们身上（实测：不加这段，deckkit 装的游戏在补丁眼里根本不存在）
-cands=/tmp/deckkit-patch-games.tsv
 : > "$cands"
-for lib in $libs; do
+# 库路径按**行**读：`for lib in $libs` 会把含空格的库路径拆成两个词（review 抓到）
+printf '%s\n' "$libs" | while IFS= read -r lib; do
+  [ -n "$lib" ] || continue
   for acf in "$lib"/steamapps/appmanifest_*.acf; do
     [ -f "$acf" ] || continue
     id="$(basename "$acf" | sed 's/^appmanifest_//; s/\.acf$//')"
     name="$(sed -n 's/.*"name"[[:space:]]*"\([^"]*\)".*/\1/p' "$acf" | head -1)"
     idir="$(sed -n 's/.*"installdir"[[:space:]]*"\([^"]*\)".*/\1/p' "$acf" | head -1)"
-    case "$idir" in *Proton*|*SteamLinuxRuntime*|*"Steam Linux Runtime"*|*Steamworks*) continue ;; esac
+    is_runtime "$idir" && continue
     gdir="$lib/steamapps/common/$idir"
     [ -d "$gdir" ] || continue
     printf '%s\t%s\t%s\n' "$id" "$name" "$gdir" >> "$cands"
@@ -328,70 +431,178 @@ for d in "$HOME"/deckkit/services/games/store/*/; do
   printf '%s\t%s\t%s\n' "$gid" "$gname" "$gdir" >> "$cands"
 done
 
-best_id=""; best_name=""; best_dir=""; best_n=0; second_n=0; second_name=""
+# 打分。**只看"路径命中数"会错**（实测 Another Game 一代补丁被挂到二代）：
+# 同名系列作的目录结构一模一样（同引擎、同顶层目录），后作的目录里往往**全都能命中**
+# 前作补丁的路径，于是"命中最多者胜"必然倒向续作。
+# 所以除路径命中外再收两个量，都不需要额外 I/O：
+#   · 替换命中 = 补丁里**该游戏本来就有**的文件数（前作补丁打不进续作的原生文件）
+#   · 目录文件数 = 该游戏自己有多少文件（用来把"命中数"归一化，见下面 rel 的比较）
+# 但**不用 md5 内容比对来否决候选**：补丁已挂载时文件内容就等于 manifest，
+# 且坏挂载会污染内容（实测二代被一代补丁覆盖后，二代自己的补丁都比对不上），
+# 内容只能当"参考量"打印给人看，绝不能当判据。
+: > "$scores"   # 每次重新收集（别把上一次的候选留下来）
+best_id=""; best_name=""; best_dir=""; best_n=0; best_rep=0; best_total=0
+second_n=0; second_name=""
 while IFS=$'\t' read -r id name gdir; do
   [ -n "${id:-}" ] || continue
   if [ -n "$want" ] && [ "$want" != "$id" ] && [ "$want" != "$name" ] && [ "$want" != "$(basename "$gdir")" ]; then continue; fi
-  n=0
+  n=0; rep=0
   for r in "${rels[@]}"; do
     [ -n "$r" ] || continue
-    [ -e "$gdir/$r" ] && n=$((n + 1))
+    if [ -e "$gdir/$r" ]; then n=$((n + 1)); rep=$((rep + 1)); fi
   done
+  # 目录里"文件"总数（不算目录），用于后面按体量归一化
+  total="$(find "$gdir" -type f 2>/dev/null | wc -l)"
   if [ "$n" -gt "$best_n" ]; then
     second_n="$best_n"; second_name="$best_name"
-    best_n=$n; best_id="$id"; best_name="$name"; best_dir="$gdir"
+    best_n=$n; best_rep=$rep; best_total=$total
+    best_id="$id"; best_name="$name"; best_dir="$gdir"
   elif [ "$n" -gt "$second_n" ]; then second_n="$n"; second_name="$name"; fi
+  # 候选明细：给人看，也用于"系列作歧义"判定
+  printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$n" "$rep" "$total" >> "$scores"
 done < "$cands"
 printf '%s\t%s\t%s\t%s\n' "$best_n" "$best_id" "$best_name" "$best_dir"
 printf '%s\n' "$second_n"
 printf '%s\n' "$second_name"
+printf '%s\n' "$best_rep"
+printf '%s\n' "$best_total"
+# 系列作歧义（**这次翻车的那一类**）：候选里出现名字互为前缀的一对
+# （Another Game ⊂ Another Game 2）。同名系列作同引擎、同顶层目录结构，
+# 前作补丁的路径在后作目录里往往**全部命中**，所以"命中最多者胜"在这类游戏上
+# 本质不可分 —— 实测两例（都是 100% vs 3% 的悬殊比分，看起来都很"确定"）：
+#   一代补丁 → BS1=2   BS2=63    （胜者错！）
+#   二代补丁 → BS1=3   BS2=144   （胜者对）
+# 光看命中数和比例分不出这两者，因此这里**不再自己判**：系列对同时命中时，
+# 一律把两边都打印出来、要求 --game 明确指定。宁可多问一次，也不替用户赌。
+# 用户写了 --game 就是明确指定，不再拦。
+awk -F'\t' '
+  { id[NR]=$1; nm[NR]=$2; n[NR]=$3; rep[NR]=$4; tot[NR]=$5; cnt=NR }
+  END {
+    for (i=1; i<=cnt; i++) {
+      if (n[i]+0 == 0) continue
+      for (j=1; j<=cnt; j++) {
+        if (i==j || n[j]+0 == 0) continue
+        a=tolower(nm[i]); b=tolower(nm[j])
+        if (a != b && index(b, a) == 1) {
+          print nm[i] "\t" nm[j] "\t" n[i] "\t" n[j]
+          exit
+        }
+      }
+    }
+  }' "$scores"
 REMOTE
 }
 
+# 解包失败时的分诊：调 patch-extract.py classify 拿"依据"，据此给**对的**下一步。
+# 之前只有一句「它可能是真安装器」——实测私有自解压器（加密壳）会被这么说，
+# 用户按提示重试仍失败，不知道到底该干嘛。
+patch_unpack_failed_hint() {
+  local exe="$1" line kind why
+  # classify 的 stderr 不吞：python 出错时（比如文件读不了）要看得见原始报错
+  line="$(python3 "$MAC_DIR/patch-extract.py" classify "$exe" | head -1)"
+  kind="$(printf '%s' "$line" | cut -f1)"
+  why="$(printf '%s' "$line" | cut -f2)"
+  [ -n "$why" ] && dim "  判定依据：${why}"
+  case "$kind" in
+    installer)
+      say "  这类有标准安装器框架 —— 用安装器方式跑（在 Deck 上开向导，装到游戏目录）："
+      say "    ${C_B}deck patches add '$exe' --installer --game '<游戏名|appid>'${C_RST}"
+      ;;
+    selfextract)
+      say "  这是**私有自解压器**：内容被加密/私有格式包着，sfextract / innoextract / 7z 都解不开。"
+      say "  只能真把它跑起来装 —— 用安装器方式（在 Deck 上开向导）："
+      say "    ${C_B}deck patches add '$exe' --installer --game '<游戏名|appid>'${C_RST}"
+      dim "  提示：它可能自己读游戏写下的注册表键找目录（这条路会用**游戏自己的 prefix**，"
+      dim "  所以认得游戏）；装完会前后对比游戏目录，0 个文件变化会明确告诉你装到别处了。"
+      ;;
+    sfx_plain)
+      say "  尾部有附加数据但不像加密 —— 先确认解包器装齐了："
+      dim "    Setup Factory: pip3 install --user sfextract"
+      dim "    Inno Setup:    brew install innoextract"
+      dim "    压缩包/NSIS:   brew install sevenzip"
+      say "  装齐后重跑；若仍解不开，改用安装器方式："
+      say "    ${C_B}deck patches add '$exe' --installer --game '<游戏名|appid>'${C_RST}"
+      ;;
+    not_pe)
+      dim "  它不是 Windows 可执行文件 —— 确认这是补丁本体（不是分卷/说明文件）"
+      ;;
+    *)
+      say "  没探测到安装器特征 —— 它可能不是补丁（而是游戏主程序/工具）。"
+      say "  如果确实是补丁，试安装器方式："
+      say "    ${C_B}deck patches add '$exe' --installer --game '<游戏名|appid>'${C_RST}"
+      ;;
+  esac
+}
+
 cmd_add() {
-  local exe="" want="" name="" only_id="" installer=0
+  local exe="" want="" name="" only_id="" installer=0 force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) shift; only_id="${1:-}" ;;          # 已知目标（重挂备料用），跳过推断
       --game) shift; want="${1:-}" ;;
       --name) shift; name="${1:-}" ;;
       --installer) installer=1 ;;               # 「带安装器的补丁」：跑向导，不解包
+      --force) force=1 ;;                       # 库里已有同 id 记录 → 覆盖它（先删旧记录）
       --no-payload) KEEP_PAYLOAD="no" ;;
       -*) die "add: 不认识的选项 $1" ;;
       *) exe="$1" ;;
     esac
     shift
   done
-  [ -n "$exe" ] || die "用法：deck patches add <补丁.exe|补丁文件夹|补丁.zip> [--game <游戏名|appid>] [--name <短名>] [--installer]"
+  [ -n "$exe" ] || die "用法：deck patches add <补丁.exe|补丁文件夹|补丁.zip> [--game <游戏名|appid>] [--name <短名>] [--installer] [--force]"
   [ -e "$exe" ] || die "找不到：$exe"
   [ "$installer" = 1 ] && [ -d "$exe" ] && die "--installer 是给补丁 exe 用的；文件夹本身就是「文件包」型，去掉这个选项"
   local is_dir=0; [ -d "$exe" ] && is_dir=1
-  require_deck
+  deck_required
   if [ "$installer" = 1 ]; then
-    cmd_add_installer "$exe" "$want" "$name"
+    cmd_add_installer "$exe" "$want" "$name" "$force"
     return $?
   fi
 
   local base; base="$(basename "${exe%/}")"
-  [ -n "$name" ] || name="$(slugify "$base")"
+  [ -n "$name" ] || name="$(deckkit_slug "$base" 48)"
   [ -n "$name" ] || die "无法从文件名推断短名，用 --name 指定"
 
-  local work; work="$(mktemp -d "${TMPDIR:-/tmp}/deckkit-patch.XXXXXX")"
+  # 临时目录走全局 WORK_TMP + 脚本头部的 EXIT trap：
+  # 以前 `work` 是函数里的 local，只在几条失败路径上 rm -rf —— 中途 die / Ctrl-C
+  # 就把解包结果和清单留在 /tmp 里（review 抓到）。
+  if ! WORK_TMP="$(mktemp -d "${TMPDIR:-/tmp}/deckkit-patch.XXXXXX")"; then
+    WORK_TMP=""
+    die "建不了临时目录（TMPDIR=${TMPDIR:-/tmp}）"
+  fi
+  local work="$WORK_TMP"
   hdr "解包"
-  local cands; cands="$(python3 "$MAC_DIR/patch-extract.py" prepare "$exe" "$work")" || {
-    rm -rf "$work"
-    die "解包失败（看上面提示）。如果这个补丁是**带安装器的**（跑向导才装得上），换这条路：
-       deck patches add '$exe' --installer [--game <游戏名|appid>]"; }
-  # 输入是文件夹就直接用它；否则用 work/extract
-  local src_root="$work/extract"; [ "$is_dir" = 1 ] && src_root="${exe%/}"
-  printf '%s\n' "$cands" | while IFS=$'\t' read -r r n b; do dim "  候选根 ${r}：$n 个文件 / $(human "$b")"; done
+  # prepare 的第 1 行是 `BASE\t<解包根>`，第 2 行起才是候选根。为什么要有这一行：
+  # 输入是**文件夹**时解包根不一定是用户那个目录 —— patch-extract.py 需要就地
+  # 改名/整理（Windows 反斜杠路径）时，会先把内容硬链到 work 里再动，
+  # 用户目录**只读**（review 抓到过 `os.replace` 覆盖用户文件）。
+  local out base_line cands
+  out="$(python3 "$MAC_DIR/patch-extract.py" prepare "$exe" "$work")" || {
+    # 解包失败：别再笼统说"它可能是带安装器的"（实测有私有自解压器会被这么说，
+    # 但真因是加密/私有格式）。这里当场分类，把**依据**打出来，并给出对应走法。
+    patch_unpack_failed_hint "$exe"
+    die "解包失败：这个补丁解不出文件清单（走不了「覆盖文件」那条路）"; }
+  base_line="$(printf '%s\n' "$out" | sed -n '1s/^BASE\t//p')"
+  cands="$(printf '%s\n' "$out" | sed '1d')"
+  [ -n "$base_line" ] && [ -d "$base_line" ] \
+    || die "解包异常：没拿到解包根（patch-extract.py prepare 的第一行应该是 BASE<tab><目录>）"
+  local src_root="$base_line"
+  printf '%s\n' "$cands" | while IFS=$'\t' read -r r n b; do dim "  候选根 ${r}：$n 个文件 / $(deckkit_human "$b")"; done
 
   local root="" picked="" rels="$work/rels.tsv" best_n=0 second_n=0 second_name=""
+  # 第二路证据（见 infer_game 里的说明）：原有文件命中数、目录文件数、系列作歧义
+  local hit_rep=0 hit_total=0 series_amb=""
   # --id：重挂备料。目标游戏已知（读 Deck 上的记录），只需找到与已有 manifest 一致的载荷根
   if [ -n "$only_id" ]; then
-    local gid; gid="$(rsh "sed -n 's/^dir=//p' \"\${HOME}/deckkit/services/patches/store/${only_id%/*}/.game\"" | head -1)"
-    local oldman="/tmp/deckkit-old-manifest.tsv"
-    rsh "cat \"\${HOME}/deckkit/services/patches/store/$only_id/manifest.tsv\"" > "$oldman" || die "读不到已有 manifest"
+    local gid oldman
+    if ! gid="$(rsh "sed -n 's/^dir=//p' $(printf '%q' "$DECK_PATCH_ABS/store/${only_id%/*}/.game")" | head -1)"; then
+      die "读不到 Deck 上的游戏记录：${only_id}（远端报错见上）"
+    fi
+    [ -n "$gid" ] || die "Deck 上的记录里没有游戏目录（$DECK_PATCH_ABS/store/${only_id%/*}/.game）"
+    oldman="$work/old-manifest.tsv"
+    if ! rsh "cat $(printf '%q' "$DECK_PATCH_ABS/store/$only_id/manifest.tsv")" > "$oldman"; then
+      die "读不到已有 manifest：${only_id}（远端报错见上）"
+    fi
     cut -f1 "$oldman" | sort > "$work/want.paths"
     while IFS=$'\t' read -r r n b; do
       [ -n "$r" ] || continue
@@ -399,11 +610,11 @@ cmd_add() {
       cut -f1 "$work/m.tsv" | sort > "$work/have.paths"
       if cmp -s "$work/want.paths" "$work/have.paths"; then
         root="$r"; best_n="$(grep -c . "$work/want.paths")"
-        picked="${only_id%/*}|$(rsh "sed -n 's/^name=//p' \"\${HOME}/deckkit/services/patches/store/${only_id%/*}/.game\"" | head -1)|$gid"
+        picked="${only_id%/*}|$(rsh "sed -n 's/^name=//p' $(printf '%q' "$DECK_PATCH_ABS/store/${only_id%/*}/.game")" | head -1)|$gid"
         cp "$work/m.tsv" "$work/rels.tsv"; break
       fi
     done <<< "$cands"
-    [ -n "$root" ] || { rm -rf "$work"; die "解出来的内容和登记的清单对不上（安装包换版本了？先 deck patches add 重新入库）"; }
+    [ -n "$root" ] || die "解出来的内容和登记的清单对不上（安装包换版本了？先 deck patches add 重新入库）"
   fi
 
   # 候选根按文件数降序试，命中游戏文件最多的那个就是 payload 根
@@ -419,6 +630,9 @@ cmd_add() {
     IFS=$'\t' read -r _ hid hname hdir <<< "$line1"
     second_n="$(printf '%s' "$hit" | sed -n 2p)"
     second_name="$(printf '%s' "$hit" | sed -n 3p)"
+    hit_rep="$(printf '%s' "$hit" | sed -n 4p)"
+    hit_total="$(printf '%s' "$hit" | sed -n 5p)"
+    series_amb="$(printf '%s' "$hit" | sed -n 6p)"
     dim "  用 ${r} 去比对：命中 ${hn:-0} 个文件${hname:+（${hname}）}"
     if [ "${hn:-0}" -gt 0 ]; then
       root="$r"; best_n="$hn"; picked="$hid|$hname|$hdir"; cp "$work/m.tsv" "$rels"; break
@@ -430,7 +644,6 @@ cmd_add() {
     say ""
     say "Deck 上已安装的游戏（用 --game <名字|appid> 手动指定目标）："
     pctl suggest | sed 's/^/    /'
-    rm -rf "$work"
     die "没找到匹配的游戏，未做任何改动"
   fi
   local appid gname gdir
@@ -439,20 +652,30 @@ cmd_add() {
 
   local files bytes
   files="$(grep -c . "$rels")"; bytes="$(awk -F'\t' '{s+=$3} END{print s+0}' "$rels")"
-  # 置信度：并列 → 不敢猜；命中比例低 → 提醒（挂载可逆，不拦）
-  if [ "${second_n:-0}" -gt 0 ] && [ "${second_n}" = "${best_n}" ]; then
-    bad "两个游戏命中数一样多（各 ${best_n} 个）—— 不敢替你选"
-    dim "  用 --game <名字|appid> 指定：deck patches add '<补丁>' --game '<游戏名>'"
-    rm -rf "$work"; die "目标不唯一，未做任何改动"
+
+  # 系列作歧义（**这次翻车的那一类**）：候选里出现名字互为前缀的一对
+  # （Another Game ⊂ Another Game 2），且两个都有命中 —— 路径命中数会被
+  # 续作的"目录里啥都有"顶到最高，硬选就是替用户赌。直接要求 --game。
+  # 只在用户没写 --game 时拦（写了就是明确指定）。
+  if [ -z "$want" ] && [ -n "${series_amb:-}" ]; then
+    local s1 s2 n1 n2
+    s1="$(printf '%s' "$series_amb" | cut -f1)"
+    s2="$(printf '%s' "$series_amb" | cut -f2)"
+    n1="$(printf '%s' "$series_amb" | cut -f3)"
+    n2="$(printf '%s' "$series_amb" | cut -f4)"
+    bad "「${s1}」和「${s2}」是同一系列，补丁内容分不出是哪一部 —— 不敢替你选"
+    dim "  ${s1} 命中 ${n1} 个文件；${s2} 命中 ${n2} 个"
+    dim "  同名系列作目录结构一样，前作补丁在后作目录里也能全命中（就是这次踩的坑），"
+    dim "  所以这一对不能靠命中数自动定 —— 请你指定："
+    dim "    deck patches add '<补丁>' --game '${s1}'"
+    dim "    deck patches add '<补丁>' --game '${s2}'"
+    die "目标不唯一，未做任何改动"
   fi
-  if [ "${best_n:-0}" -lt 3 ] || [ $((best_n * 3)) -lt "$files" ]; then
-    warn "置信度低：只命中 ${best_n}/${files} 个文件 —— 确认是这个游戏的补丁？"
-  fi
-  # 置信度：命中数并列 → 不敢猜；命中比例低 → 提醒一句（挂载可逆，不拦）
+  # 置信度：命中数并列 → 不敢猜；命中比例低 → 提醒（挂载可逆，不拦）
   if [ "${second_n:-0}" -gt 0 ] && [ "$second_n" = "$best_n" ]; then
     bad "两个游戏命中数一样多（各 ${best_n} 个）—— 不敢替你选"
     dim "  用 --game <名字|appid> 指定目标：deck patches add '<补丁>' --game '<游戏名>'"
-    rm -rf "$work"; die "目标不唯一，未做任何改动"
+    die "目标不唯一，未做任何改动"
   fi
   if [ "$best_n" -lt 3 ] || [ $((best_n * 3)) -lt "$files" ]; then
     warn "置信度低：只命中 ${best_n}/${files} 个文件 —— 确认是这个游戏的补丁？"
@@ -460,10 +683,23 @@ cmd_add() {
   hdr "入库"
   ok "目标游戏 ${gname}（appid ${appid}）"
   ok "游戏目录 $gdir"
-  ok "补丁文件 $files 个 / $(human "$bytes")"
+  ok "补丁文件 $files 个 / $(deckkit_human "$bytes")"
+  # 参考量（不是判据）：这些命中里有多少是该游戏本来就有的文件。
+  # 替换命中占比低 = 这个补丁几乎全是"新增文件"，路径证据偏弱，提醒一句。
+  if [ -n "${hit_total:-}" ] && [ "${hit_total:-0}" -gt 0 ]; then
+    dim "  路径证据：命中 ${best_n}/${files}，其中该游戏原有文件 ${hit_rep:-0} 个（目录共 ${hit_total} 个文件）"
+    if [ "${hit_rep:-0}" -lt 2 ]; then
+      warn "这个补丁在该游戏里几乎全是新增文件（原有文件只命中 ${hit_rep:-0} 个）—— 路径证据偏弱"
+      dim "  系列作/同引擎游戏容易互相混淆，确认目标没错；不对就 --game 重跑"
+    fi
+  fi
 
   local rdir="$DECK_PATCH_ABS/store/$appid/$name"
-  rsh "mkdir -p \"\${HOME}/deckkit/services/patches/store/$appid/$name\"" || die "Deck 上建目录失败"
+  # 同 id 已在库里 → 默认拒绝（以前直接覆盖写，前一份的 manifest/meta 就没了）。
+  # 例外：`--id` 是「已知记录的重新备料」（mount 时临时重传 payload），那本来就该
+  # 覆盖自己 —— 所以不拦。
+  [ -n "$only_id" ] || guard_existing "$rdir" "$force"
+  rsh "mkdir -p $(printf '%q' "$rdir")" || die "Deck 上建目录失败：$rdir"
 
   local src_kind="exe"
   if [ "$is_dir" = 1 ]; then
@@ -476,20 +712,18 @@ cmd_add() {
     dim "  按配置**不往 Deck 留安装包**（原文件你自己保存；重挂时再选一次即可）"
   fi
 
-  if true; then   # payload 一律先传上去（挂载需要），挂完按 KEEP_PAYLOAD 决定删不删
-    say "${C_DIM}==> 上传解包结果（临时：挂载完就删）${C_RST}"
-    # 目标目录要先在 Deck 上建好：Mac 自带的是 openrsync（2.6.9 协议），
-    # 让它在远端顺手创建多级目录会报 "destination must be a directory"。
-    # 用 tar 走 ssh，不用 rsync：Mac 自带的是 openrsync（2.6.9 协议），
-    # 和 Deck 上的 rsync 3.4 传多文件时会报 "destination must be a directory"。
-    COPYFILE_DISABLE=1 tar -C "$src_root/${root#./}" -cf - . \
-      | ssh "${SSH_OPTS[@]}" "$DECK_SSH" \
-        "mkdir -p \"\${HOME}/deckkit/services/patches/store/$appid/$name/payload\" && tar --warning=no-unknown-keyword -C \"\${HOME}/deckkit/services/patches/store/$appid/$name/payload\" -xf -" \
-      || die "上传 payload 失败"
-  fi
+  # payload 一律先传上去（挂载需要），挂完按 KEEP_PAYLOAD 决定删不删。
+  # 用 tar 走 ssh，不用 rsync：Mac 自带的是 openrsync（2.6.9 协议），和 Deck 上的
+  # rsync 3.4 传多文件时会报 "destination must be a directory"；所以远端目录
+  # 先在本地拼好命令（%q 引用）里 mkdir 出来，再 tar -xf。
+  say "${C_DIM}==> 上传解包结果（临时：挂载完就删）${C_RST}"
+  COPYFILE_DISABLE=1 tar -C "$src_root/${root#./}" -cf - . \
+    | ssh "${SSH_OPTS[@]}" "$DECKKIT_SSH_TARGET" \
+      "mkdir -p $(printf '%q' "$rdir/payload") && tar --warning=no-unknown-keyword -C $(printf '%q' "$rdir/payload") -xf -" \
+    || die "上传 payload 失败"
 
   # manifest + 元信息
-  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/patches/store/$appid/$name/manifest.tsv\"" < "$rels" || die "上传 manifest 失败"
+  rsh_put "$rels" "$rdir/manifest.tsv" || die "上传 manifest 失败"
   # 认重：exe 按文件哈希；文件夹按内容打包哈希
   local sha
   if [ "$is_dir" = 1 ]; then
@@ -497,10 +731,10 @@ cmd_add() {
   else
     sha="$(shasum -a 256 "$exe" | cut -d' ' -f1)"
   fi
-  rsh_script "$appid" "$name" "$gname" "$gdir" "$base" "$files" "$bytes" "$sha" "$src_kind" <<'REMOTE' || die "写 meta 失败"
-appid="$1"; slug="$2"; gname="$3"; gdir="$4"; orig="$5"; files="$6"; bytes="$7"; sha="$8"; kind="$9"
-d="$HOME/deckkit/services/patches/store/$appid/$slug"
-mkdir -p "$d"
+  rsh_script "$DECK_PATCH_ABS" "$appid" "$name" "$gname" "$gdir" "$base" "$files" "$bytes" "$sha" "$src_kind" <<'REMOTE' || die "写 meta 失败"
+root="$1"; appid="$2"; slug="$3"; gname="$4"; gdir="$5"; orig="$6"; files="$7"; bytes="$8"; sha="$9"; kind="${10}"
+d="$root/store/$appid/$slug"
+mkdir -p "$d" || exit 1
 {
   printf 'name=%s\n' "$slug"
   printf 'game_name=%s\n' "$gname"
@@ -512,13 +746,18 @@ mkdir -p "$d"
   printf 'sha256=%s\n' "$sha"
   printf 'source=%s\n' "$kind"
 } > "$d/meta.tsv"
-mkdir -p "$HOME/deckkit/services/patches/store/$appid"
-printf 'name=%s\ndir=%s\n' "$gname" "$gdir" > "$HOME/deckkit/services/patches/store/$appid/.game"
+mkdir -p "$root/store/$appid" || exit 1
+printf 'name=%s\ndir=%s\n' "$gname" "$gdir" > "$root/store/$appid/.game"
 echo "  meta 已写入 $d"
 REMOTE
-  rm -rf "$work"
-  ok "入库完成：$appid/$name"
-  dim "  挂载：deck patches mount $appid/$name"
+  # add 只入库、**不动游戏文件** —— 这一步没有任何文件被覆盖。
+  # 以前这里只 dim 一行"挂载：..."，很容易被当成"跑完了但没挂上"（实测就有人这么以为）。
+  # 所以明确说清楚：现在还没挂，并给出可直接复制的那条命令。
+  hdr "入库完成 —— 还没挂载"
+  ok "补丁已入库：$appid/${name}（目标 ${gname}）"
+  dim "  注意：add 只入库，**游戏文件一个字节都没动**。"
+  say "  要真正打上去，再跑这一条："
+  say "    ${C_B}deck patches mount $appid/$name${C_RST}"
 }
 
 # ------------------------------------------------------- mount 等动作 -----
@@ -533,40 +772,66 @@ stage_payload() {
 drop_payload() {
   local dir="$1"
   [ "$KEEP_PAYLOAD" = "yes" ] && return 0
-  # 远端引号里的 ~ 不展开。传进来两种形态都要认：patch_dir_of 现在给**绝对路径**，
-  # 而 cmd_mount_file 那边还是 ~ 形态 —— 只按 ~ 处理的话，绝对路径会被拼成
-  # ${HOME}//home/deck/... 然后 `rm -rf` 静默什么也没删（payload 就永远留在 Deck 上了）。
+  # 远端引号里的 ~ 不展开，所以两种形态都要认：patch_dir_of 给**绝对路径**，
+  # ~ 形态是历史调用点（拼错的话 `rm -rf` 什么都删不掉，payload 就永远留在 Deck 上）。
   local rdir
   case "$dir" in
     "~/"*) rdir="\${HOME}/${dir#\~/}" ;;
     *)     rdir="$dir" ;;
   esac
-  rsh "rm -rf \"$rdir/payload\"" 2>/dev/null
-  dim "  已清掉 Deck 上的解包缓存（重挂时再选一次安装包即可）"
+  # §6 第一道阀：只允许删 <补丁库>/store/<appid>/<补丁>/payload 这一层。
+  # 以前这里是无条件 `rm -rf "$rdir/payload"` —— 传进来一个空路径或库根路径就完了。
+  case "$rdir" in
+    "$DECK_PATCH_ABS"/store/?*/?*|"${HOME}"/deckkit/services/patches/store/?*/?*) ;;
+    *) bad "拒绝删除 payload：路径结构不是 store/<appid>/<补丁>（${dir}）"; return 1 ;;
+  esac
+  case "$rdir" in *..*) bad "拒绝删除 payload：路径里有 ..（${dir}）"; return 1 ;; esac
+  if rsh "rm -rf $(printf '%q' "$rdir/payload")"; then
+    dim "  已清掉 Deck 上的解包缓存（重挂时再选一次安装包即可）"
+  else
+    warn "没删掉 Deck 上的解包缓存（远端报错见上）：$rdir/payload"
+  fi
 }
 
 cmd_action() {
   local action="$1"; shift
   [ "$action" = "rm" ] && action="remove"      # 短别名（和 games 的 rm 一致）
-  local id="${1:-}"; [ -n "$id" ] && shift
-  case "${1:-}" in --yes|-y) ;; esac
+  local id="" yes=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) yes=1 ;;
+      --force)  force=1 ;;
+      -*) die "$action: 不认识的选项 $1" ;;
+      *) [ -n "$id" ] || id="$1" ;;
+    esac
+    shift
+  done
   [ -n "$id" ] || die "用法：deck patches $action <补丁>（deck patches list 看有哪些）"
-  require_deck
-  local dir; dir="$(patch_dir_of "$id")" || die "补丁库里找不到唯一匹配：$id"
+  deck_required
+  local dir rc=0
+  dir="$(patch_dir_of "$id")" || rc=$?
+  case "$rc" in
+    0) ;;
+    2) die "列不出补丁库（远端报错见上）—— 这一条不是「库里没有 ${id}」" ;;
+    *) die "补丁库里找不到唯一匹配：${id}（deck patches list 看有哪些）" ;;
+  esac
+  # 已解析出来的**目录**才是唯一可信的 id：$id 可能只是个 slug、甚至和目录名不同。
+  # 以前 mount 分支拿 $id 去拼远端路径、拿 $id 去 awk 比对 list —— payload 探测必然
+  # 落空、挂载计划也空着，然后报「Deck 上没有这个补丁的内容」，把人引去重复 add。
+  local pid="${dir#"$DECK_PATCH_ABS"/store/}"
   case "$action" in
     mount)
       # 安装器型补丁没有 payload，也没有「原安装包」可指 —— 单独说清楚怎么重装
-      if [ "$(pctl kind "$dir" 2>/dev/null)" = "installer" ]; then
+      local kind; kind="$(pctl kind "$dir")" || die "读不到补丁记录（远端报错见上）：$pid"
+      if [ "$kind" = "installer" ]; then
         die "这是「安装器型补丁」（kind=installer）：库里不留补丁内容，重装要重新上传一次安装器：
        deck patches add '<补丁.exe>' --installer --game <游戏名|appid>"
       fi
-      # $dir 是 Deck 上的路径（带 ~），必须在远端判断，不能在本地 test -d
-      if ! rsh "test -d \"\${HOME}/deckkit/services/patches/store/$id/payload\""; then
+      if ! rsh_test_d "$dir/payload"; then
         die "Deck 上没有这个补丁的内容（按配置不留缓存）—— 用原安装包重挂：deck patches mount-file '<补丁.exe>'"
       fi
-      local st; st="$(pctl state "$dir")"
       hdr "挂载计划"
-      pctl list | awk -F'\t' -v want="${id}" '$1==want {printf "  %s · %s · %s 个文件\n", $2, $3, $5}'
+      pctl_list | awk -F'\t' -v want="$pid" '$1==want {printf "  %s · %s · %s 个文件\n", $2, $3, $5}'
       dim "  **不备份**被替换的原始文件（按配置）；要还原用 Steam → 验证文件完整性"
       dim "  补丁内容用完即删，重挂时再选一次安装包"
       pctl mount "$dir" || die "挂载失败"
@@ -574,25 +839,47 @@ cmd_action() {
       ;;
     unmount) pctl unmount "$dir" ;;   # 现在只给出「用 Steam 验证完整性」的提示
     toggle)
-      local st; st="$(pctl state "$dir")"
+      local st; st="$(pctl state "$dir")" || die "读不到挂载状态（远端报错见上）"
       if [ "$st" = "mounted" ]; then pctl unmount "$dir" || die "卸载失败"; else pctl mount "$dir" || die "挂载失败"; fi
       ;;
     verify)  pctl verify "$dir" ;;
     remove)
-      if [ "${1:-}" != "--yes" ] && [ "${1:-}" != "-y" ] && [ "${1:-}" != "--force" ]; then
+      if [ "$yes" = 0 ] && [ "$force" = 0 ]; then
         [ -t 0 ] || die "remove 需要 --yes（非交互环境）"
         printf '  从库里删除 %s（游戏目录不受影响）？输入 yes 继续：' "$id"
         local a=""; read -r a; [ "$a" = "yes" ] || die "已取消"
       fi
-      pctl remove "$dir" "${1:-}" || die "删除失败" ;;
+      if [ "$force" = 1 ]; then
+        pctl remove "$dir" --force || die "删除失败"
+      else
+        pctl remove "$dir" || die "删除失败"
+      fi ;;
     *) die "不认识的动作 $action" ;;
   esac
 }
 
 # ------------------------------------------------------------ 状态输出 ---
 cmd_status() {
-  require_deck
-  local list; list="$(pctl list)"
+  deck_required
+  # **一次**远程调用同时拿到「面板」和「机器可读状态行」。
+  # 以前是先 `pctl list` 取计数、再 `pctl status` 画面板 —— 两趟各自把同一份
+  # md5/stat 在 Deck 上重算一遍（一轮白烧 6 秒 CPU、几千次 fork）。
+  # 现在 Deck 侧算一次状态，面板之后附一段 @@TSV 给这边计数用。
+  local out; out="$(pctl status --tsv)" || die "取不到补丁库状态（远端报错见上）"
+  local panel="$out" list=""
+  case "$out" in
+    *"@@TSV"*)
+      panel="${out%%@@TSV*}"
+      list="${out#*@@TSV}"
+      list="${list#$'\n'}"             # 标记行后面的第一行才是数据
+      ;;
+    *)
+      # Deck 侧还是旧版（不认 --tsv，也就不会带标记）→ 退回两次调用。
+      # 没有这个兜底的话 list 会是空的，于是**假装「补丁库是空的」** ——
+      # 慢一点可以接受，报一个假状态不行。
+      list="$(pctl_list)" || die "列不出补丁库（远端报错见上）"
+      ;;
+  esac
   if [ -z "$list" ]; then
     printf '%s!%s 补丁库是空的 —— 在 Mac 上跑：deck patches add <补丁.exe>\n' "$C_YEL" "$C_RST"
   else
@@ -606,16 +893,17 @@ cmd_status() {
     else printf '%s!%s %s 个补丁 · 都没挂载（Steam 校验过完整性？点一下重挂）\n' "$C_YEL" "$C_RST" "$n"; fi
   fi
   hdr "补丁详情"
-  pctl status
+  # panel 里已经含着末尾那个换行，原样打出去（别再补一个，免得空一行）
+  printf '%s' "$panel"
   hdr "Deck 侧"
-  local sz; sz="$(rsh "du -sh \"\${HOME}/deckkit/services/patches/store\" 2>/dev/null | cut -f1")"
+  local sz; sz="$(rsh "du -sh $(printf '%q' "$DECK_PATCH_ABS/store") 2>/dev/null | cut -f1")"
   dim "  补丁库体积 ${sz:-?}（只有 manifest/resolved/meta 这几个小文件；exe 与解包缓存按配置不留）"
 }
 
 cmd_list() {
-  require_deck
+  deck_required
   hdr "补丁库"
-  local list; list="$(pctl list)"
+  local list; list="$(pctl_list)" || die "列不出补丁库（远端报错见上）"
   if [ -z "$list" ]; then warn "空的（deck patches add <补丁.exe>）"; return 0; fi
   printf '  %-22s %-28s %-10s %s\n' "补丁 id" "游戏" "状态" "文件数"
   printf '%s\n' "$list" | while IFS=$'\t' read -r id gname st stk files; do
@@ -623,66 +911,176 @@ cmd_list() {
   done
 }
 
+# 列 Deck 上的游戏。**失败和「一个都没装」必须分开**：
+#   以前是 `pctl games | while ...` —— 远端失败时输出是空的，用户看到的是
+#   「Deck 上已安装的游戏」下面一行都没有，会以为游戏没装（review 抓到）。
+#   `2>/dev/null` 也顺手去掉了：ssh 的原始报错要带出来。
 cmd_games() {
-  require_deck
+  deck_required
   hdr "Deck 上已安装的游戏"
+  local rows
+  rows="$(pctl games)" || die "列不出 Deck 上的游戏（远端报错见上）—— 不是「没装游戏」"
+  if [ -z "$rows" ]; then
+    warn "一个游戏都没列出来（Steam 库里没有已安装游戏，也可能 deckkit games 的 store 是空的）"
+    return 0
+  fi
   printf '  %-10s %-42s %s\n' "appid" "游戏" "大小"
-  pctl games | while IFS=$'\t' read -r id name dir sz; do
+  printf '%s\n' "$rows" | while IFS=$'\t' read -r id name dir sz; do
     printf '  %-10s %-42s %s\n' "$id" "$name" "$sz"
   done
 }
 
 # 点菜单栏 → 选一个补丁 exe → 自己找游戏 → 挂载。
-# 同一个 exe 只会入库一次（按 sha256 认），以后重挂直接用库里的 payload。
+# 同一个 exe 只会入库一次（按 sha256 认）。**但库里的 payload 挂完就删了**
+# （KEEP_PAYLOAD_ON_DECK=no），所以重挂这条路必然是「再解包 + 临时传一次」——
+# 不是「直接用库里的 payload」（旧注释这么写，和实际行为不符）。
+#
+# 安装器型补丁（有 Inno/NSIS 指纹、或私有自解压器）**没有文件清单**，
+# 走不了"解包→比对→覆盖"那条路。以前这里是直接调 cmd_add（不带 --installer），
+# 结果选中后必然是"解包失败"——看起来就是**点了没反应**。
+# 现在这里先分类：是安装器型就自动转到安装器流程（不再要求用户改敲 add --installer）。
 cmd_mount_file() {
   local exe="${1:-}"
   [ -n "$exe" ] || die "用法：deck patches mount-file <补丁.exe>"
   [ -f "$exe" ] || die "找不到文件：$exe"
-  require_deck
+  deck_required
   local sum; sum="$(shasum -a 256 "$exe" | cut -d' ' -f1)"
-  local id; id="$(pctl find-sha "$sum" || true)"
-  if [ -z "$id" ]; then
-    say "${C_DIM}==> 库里还没有这个补丁，先入库（自己找游戏）${C_RST}"
-    cmd_add "$exe" || die "入库失败 —— 没找到匹配的游戏？见上面的提示"
-    id="$(pctl find-sha "$sum" || true)"
-    [ -n "$id" ] || die "入库后仍然找不到这个补丁（异常）"
+  # find-sha 的退出码只表示「远端这条命令跑通了没」：跑通但没找到 → 输出为空。
+  # 以前写 `|| true`，ssh 失败也会掉进「库里没有这个补丁」→ 白走一遍入库（重复入库）。
+  local id
+  id="$(pctl find-sha "$sum")" || die "查补丁库失败（远端报错见上）—— 这一条不是「库里没有」"
+  # 库里已认识这个补丁 → 直接走原来的重挂/核对（库里的记录已经定过类型）
+  if [ -n "$id" ]; then
+    mount_existing "$exe" "$id"
+    return $?
   fi
-  local st; st="$(pctl state "$DECK_PATCH_ABS/store/$id" 2>/dev/null || true)"
+
+  # 库里没有：先分类，再决定走哪条路
+  local line kind why
+  line="$(python3 "$MAC_DIR/patch-extract.py" classify "$exe" | head -1)"
+  kind="$(printf '%s' "$line" | cut -f1)"
+  why="$(printf '%s' "$line" | cut -f2)"
+  say "${C_DIM}==> 库里还没有这个补丁${C_RST}"
+
+  if [ "$kind" = "installer" ] || [ "$kind" = "selfextract" ]; then
+    hdr "这是安装器型补丁 —— 走安装器流程"
+    [ -n "$why" ] && dim "  判定依据：${why}"
+    dim "  它没有文件清单，不能「解包覆盖」；要在 Deck 上把安装向导跑起来。"
+    installer_via_pick "$exe" "$why"
+    return $?
+  fi
+
+  # 其余（not_pe / sfx_plain / plain）：按文件包走解包
+  cmd_add "$exe" || die "入库失败 —— 没找到匹配的游戏？见上面的提示"
+  id="$(pctl find-sha "$sum")" || die "入库后查库失败（远端报错见上）"
+  [ -n "$id" ] || die "入库后仍然找不到这个补丁（异常）"
+  mount_existing "$exe" "$id"
+}
+
+# 库里已有记录时的挂载/核对（原来 cmd_mount_file 的后半段）
+mount_existing() {
+  local exe="$1" id="$2"
+  local dir="$DECK_PATCH_ABS/store/$id"
+  # 安装器型：库里没有 payload，重挂要重新跑一次安装器
+  local kind; kind="$(pctl kind "$dir")" || die "读不到补丁记录（远端报错见上）：$id"
+  if [ "$kind" = "installer" ]; then
+    hdr "这个补丁是安装器型（库里有记录）"
+    dim "  安装器型不留 payload，重装要再跑一次向导。"
+    local gname; gname="$(rsh "sed -n 's/^game=//p' $(printf '%q' "$dir/meta.tsv")" | head -1)"
+    [ -n "$gname" ] && dim "  目标游戏：${gname}"
+    installer_via_pick "$exe" "库里已有记录（kind=installer）"
+    return $?
+  fi
+  local st; st="$(pctl state "$dir")" || die "读不到挂载状态（远端报错见上）：$id"
   if [ "$st" = "mounted" ]; then
     ok "这个补丁已经挂载着（${id}）—— 再核对一遍"
-    pctl verify "$DECK_PATCH_ABS/store/$id"
-    drop_payload "$DECK_PATCH_ROOT/store/$id"
+    pctl verify "$dir"
+    drop_payload "$dir"
     return 0
   fi
-  if ! rsh "test -d \"\${HOME}/deckkit/services/patches/store/$id/payload\""; then
+  if ! rsh_test_d "$dir/payload"; then
     stage_payload "$exe" "$id"
   fi
   cmd_action mount "$id"
+}
+
+# 从菜单栏选中的安装器型补丁：**自动推断目标游戏**，推断不出才要求手输。
+# 背景：pick 这条路上用户没法写 --game，而安装器型只能按文件名猜目标；
+# 猜不出就直接让他敲一下 appid/名字，别把一个死胡同丢给他。
+installer_via_pick() {
+  local exe="$1" why="$2"
+  local base; base="$(basename "$exe")"
+  say ""
+  dim "  按文件名找 Deck 上对应的游戏…"
+  local row rc=0
+  row="$(game_from_name "$base" "")" || rc=$?
+  local appid="" gname=""
+  if [ "$rc" = 0 ]; then
+    appid="$(printf '%s' "$row" | cut -f1)"
+    gname="$(printf '%s' "$row" | cut -f2)"
+    ok "目标游戏 ${gname}（appid ${appid}）· 按文件名猜的"
+  else
+    if [ "$rc" = 4 ]; then
+      bad "列不出 Deck 上的游戏（原始报错见上）—— 不是「看不出目标游戏」"
+    else
+      bad "按文件名看不出目标游戏"
+    fi
+    dim "  文件名：${base}"
+    say "  Deck 上已安装的游戏："
+    pctl suggest | sed 's/^/    /'
+    say ""
+    say "  安装器型必须指明目标（它会用该游戏自己的 prefix，补丁才认得出游戏目录）："
+    say "    ${C_B}deck patches add '$exe' --installer --game '<上面任一名字或 appid>'${C_RST}"
+    return 1
+  fi
+  # 交给安装器流程（cmd_add --installer，带 --game 定死目标，不再走文件名猜测）
+  cmd_add "$exe" --installer --game "$appid"
 }
 # caps：点这个服务时，菜单栏 App 弹文件选择器，然后把选中的 exe 交给
 # mount-file（自己找游戏并挂载）。格式见 docs/约定.md §2.1：
 #   第 1 列 = 选择器里那句话，第 2 列 = 子命令，第 3 列（可选）= 文件类型过滤
 cmd_caps() { printf 'pick 选择官方补丁（exe / 压缩包 / 文件夹都行）—— 自动找 Deck 上对应的游戏并挂载\tmount-file\texe,zip,7z,rar,tar,gz,tgz,xz,dir\n'; }
-# 带安装器的补丁走不了 pick（它没有文件清单、没法自动推断目标，得人指定 --game），
-# 所以不给它单独的 pick 条目 —— 那种补丁老老实实在终端跑 add --installer。
+# 安装器型（Inno/NSIS 指纹、或私有自解压器）现在**也走这个入口**：
+# mount-file 会先 classify，是安装器型就自动转到安装器流程（在 Deck 上开向导、
+# 用游戏自己的 prefix）。只有「按文件名也猜不出目标游戏」时才要求手输 --game。
 
 cmd_install() {
-  require_deck
+  deck_required
   local tool="$DECK_DIR/patchctl.sh"
   [ -f "$tool" ] || die "缺少 $tool"
+  local lib="$ROOT_DIR/bin/deck-lib"
+  local logtool="$ROOT_DIR/bin/deck-log"
   hdr "在 Deck 上准备补丁库"
-  rsh "mkdir -p \"\${HOME}/deckkit/services/patches/store\"" || die "建目录失败"
+  rsh "mkdir -p $(printf '%q' "$DECK_PATCH_ABS/store")" || die "建目录失败：$DECK_PATCH_ABS/store"
   rsync -a "$tool" "$DECK_SSH:$DECK_PATCH_ABS/patchctl.sh" || die "上传 patchctl.sh 失败"
-  rsh "chmod 755 \"\${HOME}/deckkit/services/patches/patchctl.sh\"" || die "chmod 失败"
-  ok "patchctl.sh 已就位"
+  rsh "chmod 755 $(printf '%q' "$DECK_PATCH_ABS/patchctl.sh")" || die "chmod 失败"
+  ok "patchctl.sh 已就位（$DECK_PATCH_ABS/patchctl.sh）"
+  [ -f "$lib" ] || die "缺少 $lib —— Deck 侧 patchctl.sh 靠它（cfg/ssh/snapshot/proton 那些公共件）"
+  rsh "mkdir -p $(printf '%q' "$DECK_HOME/deckkit/bin")" || die "建 bin 目录失败"
+  # 传**绝对路径**：rsync/scp 走 SFTP 时远端 ~ 不保证展开（约定 §9）
+  rsync -a "$lib" "$DECK_SSH:$DECK_HOME/deckkit/bin/deck-lib" || die "上传 deck-lib 失败"
+  # 库是 source 进来的，不是可执行文件（源文件本体是 600，推上去要放开可读）
+  rsh "chmod 644 $(printf '%q' "$DECK_HOME/deckkit/bin/deck-lib")" \
+    || die "chmod deck-lib 失败（patchctl.sh 读不到它就只能走兜底分支）"
+  ok "公共库已就位（~/deckkit/bin/deck-lib）"
+  # 统一日志工具也一起推上来：Deck 侧安装器日志要写到统一位置，
+  # 否则 Mac 上 `deck logs patches-installer` 取不到东西。
+  if [ -f "$logtool" ]; then
+    rsync -a "$logtool" "$DECK_SSH:$DECK_HOME/deckkit/bin/deck-log" || die "上传 deck-log 失败"
+    rsh "chmod 755 $(printf '%q' "$DECK_HOME/deckkit/bin/deck-log")" || true
+    ok "统一日志工具已就位（~/deckkit/bin/deck-log）"
+  else
+    warn "找不到 $logtool —— Deck 侧日志会退回 ~/deckkit/services/patches/installer.log"
+  fi
   rsh "command -v md5sum >/dev/null && echo md5sum-ok; command -v 7z >/dev/null && echo 7z-ok; true"
-  local games; games="$(pctl games | wc -l | tr -d ' ')"
-  ok "发现 $games 个已安装游戏（已过滤 Proton / Steam Linux Runtime）"
+  local rows n
+  if rows="$(pctl games)"; then
+    n="$(printf '%s\n' "$rows" | grep -c .)"
+    ok "发现 $n 个已安装游戏（已过滤 Proton / Steam Linux Runtime）"
+  else
+    warn "没能列出游戏（远端报错见上）—— patchctl.sh 已经就位，可以稍后再试"
+  fi
   dim "  下一步：deck patches add '<补丁.exe>'"
-}
-
-usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \?//'
 }
 
 case "${1:-status}" in
@@ -691,8 +1089,11 @@ case "${1:-status}" in
   games)     shift; cmd_games ;;
   add)       shift; cmd_add "$@" ;;
   mount-file) shift; cmd_mount_file "$@" ;;
-  mount|unmount|toggle|verify|remove|rm) a="$1"; shift; cmd_action "$a" "$@" ;;
-  menu)      cmd_menu ;;
+  mount|unmount|toggle|verify|remove|rm) cmd_action "$@" ;;
+  # menu 的行格式是给菜单栏用的，实现只有 Deck 侧有（patchctl.sh menu）——
+  # 以前这里调的是本文件里**不存在**的 cmd_menu：`deck patches menu` 直接
+  # command not found，而头注释还在宣传这个子命令（review 抓到）。
+  menu)      shift; pctl menu ;;
   caps)      cmd_caps ;;
   install)   shift; cmd_install ;;
   -h|--help|help|"") usage ;;

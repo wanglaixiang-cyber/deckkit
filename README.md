@@ -16,6 +16,8 @@ Windows 游戏一条命令装好并登记进 Steam 库，补丁解包后挂载�
 ```
 deckkit/
 ├── bin/deck                 统一 CLI（服务分发 + 内建运维命令 + 各服务命令清单）
+├── bin/deck-lib             公共库：颜色/消息、cfg、SSH 复用、rsh*、slug、usage、日志
+├── bin/deck-log             统一日志入口（位置/格式/滚动定在一处）
 ├── menubar/                 菜单栏 App（Deck 状态 + 各服务一行状态 + 点开终端）
 ├── services/                各服务，每个自带 mac/ 与 deck/ 两侧
 │   ├── files/               Deck 家目录共享给 Mac（访达侧边栏里的「deck」）
@@ -33,18 +35,16 @@ deckkit/
 ## 快速开始
 
 ```bash
-# 概览：有哪些服务、Deck 在不在线、各自什么状态
-deck                       # 已装到 PATH（deck self-install 装的）；也可以用 ./bin/deck
-
-# 建个软链，之后直接用 deck
+# 建个软链（或 deck self-install），之后任意目录直接敲 deck
 ln -sf "$(pwd)/bin/deck" ~/.local/bin/deck   # 在仓库根目录执行（或直接跑 deck self-install）
 
-deck                       # 概览
+deck                       # 概览：有哪些服务、Deck 在不在线、各自什么状态
 deck brief                 # 精简状态（一个服务一行；完整：deck status）
 deck list                  # 服务清单
 deck status                # 所有服务的状态
 deck files mount           # 把 Deck 家目录挂到访达
 deck menu --run            # 编译并启动菜单栏 App
+deck logs menubar          # 看菜单栏的状态变化日志（离线/在线/抖动）
 deck ssh                   # SSH 到 Deck
 deck doctor                # 环境体检
 ```
@@ -60,6 +60,7 @@ deck doctor                # 环境体检
 | `deck status [服务]` | 查看状态（不指定则全部） |
 | `deck <服务> <子命令>` | 转发给 `services/<服务>/service` |
 | `deck menu [--run]` | 编译（并启动）菜单栏 App |
+| `deck logs [来源\|all] [行数]` | 看日志。所有组件写的是**同一套**日志（位置/格式/滚动统一），见 [`docs/约定.md`](docs/约定.md) §7；`all` 把所有来源按时间合并、`--list` 列出来源、`-f` 实时跟 |
 | `deck vitals [--json]` | 读 Deck 电量 / 充电状态 / 温度 / 运行时长 / 负载 |
 | `deck ensure [服务]` | 让服务自愈（幂等）：`files` 没挂上就挂上 |
 | `deck toggle <服务>` | 切换服务主状态：例如 `files` 是挂载 / 卸载 |
@@ -69,7 +70,7 @@ deck doctor                # 环境体检
 | `deck help` | 用法 + **每个服务最常用的命令**（按服务分段） |
 | `deck cmds` | 只列各服务的常用命令 |
 | `deck self-install` | 把 `deck` 放进 PATH（之后任意目录直接敲 `deck`） |
-| `deck doctor` | 检查 Deck 可达性 / 免密 sudo / swiftc / 菜单栏产物 / 脚本里的全角字符坑 |
+| `deck doctor` | 检查 Deck 可达性 / 免密 sudo / swiftc / 菜单栏产物 / **脚本体检**（全角字符紧跟变量、首行 shebang、重复函数定义） |
 
 ---
 
@@ -87,13 +88,11 @@ deck menu --dev         # 只想编仓库里那份（menubar/DeckKit.app），�
   记着仓库路径，靠它找 `services/` 与 `bin/deck` —— 所以仓库别删、别乱挪，
   挪了重新 `deck menu --install` 一次。开机自启就加它：
   系统设置 → 通用 → 登录项 → 添加 `DeckKit.app`。
-- **图标由代码画**（`menubar/makeicon.swift`，官方 logo 的机身标记 + 圆角深色底），
-  仓库里不放二进制素材；`menubar/AppIcon.icns` 是构建产物，不进版本库。
-
-- **图标**：Steam Deck 官方 logo 的机身标记（template image，自动适配浅色/深色菜单栏）；
-  Deck 离线时整个图标压暗。
-- **终端入口分两条**：「游戏管理（终端 · 方向键操作）」= 精简服务状态 + 游戏列表（↑↓ 选、
-  回车卸载、c 封面、f 维修、q 退出）；「完整状态（终端）」= 原来的全量 dump。日常用前者。
+- **图标由代码画**（`menubar/makeicon.swift`：官方 logo 的机身标记 + 圆角深色底），
+  以 template image 渲染，自动适配浅色/深色菜单栏；Deck 离线时压暗。
+  仓库里不放二进制素材，`menubar/AppIcon.icns` 是构建产物、不进版本库。
+- **终端入口分两条**：「游戏管理（终端）」= 方向键操作的游戏列表（↑↓ 选、←→ 翻页、
+  回车展开菜单、s 换排序、q 退出）；「完整状态（终端）」= 原来的全量 dump。日常用前者。
 - **第一栏**：Deck 在线状态、主机名与刷新时间，再加一行遥测 ——
   电量、充电状态、APU 温度、已开机时长。在用电池时这一行标黄
   （对一台常驻服务器来说靠电池跑是要留意的）；完整读数（含电池温度、负载）
@@ -131,9 +130,6 @@ deck vitals        # 命令行里看同一份读数
 deckkit/menubar/DeckKit.app/Contents/MacOS/DeckKit --dump   # 打印菜单内容后退出
 ```
 
-图标会随 Deck 在线状态变化，并且只在后台线程探测（约定 §5：绝不阻塞主线程）。
-开机自启：系统设置 → 通用 → 登录项 → 添加 `DeckKit.app`。
-
 ---
 
 ## 加一个新服务
@@ -145,11 +141,19 @@ mkdir -p services/<名字>/{mac,deck}
 
 cat > services/<名字>/service <<'EOF'
 #!/usr/bin/env bash
+# ============================================================
+#  deckkit / <名字> —— 服务入口
+#
+#    deck <名字> status      一行状态（必须实现，概览与菜单栏取第一行）
+# ============================================================
 set -uo pipefail
+SVC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SVC_DIR/../../bin/deck-lib"          # 颜色/消息/cfg/SSH/slug/usage/日志都在这里
+
 case "${1:-status}" in
-  status) echo "✓ 一行人类可读的摘要" ;;   # ← 必须实现，且是第一行
-  run)    echo "干活…" ;;
-  *)      echo "不认识子命令：$1" >&2; exit 2 ;;
+  status) ok "一行人类可读的摘要" ;;
+  -h|--help|help|"") usage ;;
+  *) die "不认识子命令：$1" ;;
 esac
 EOF
 chmod 755 services/<名字>/service
@@ -192,7 +196,6 @@ deck games add '.../游戏目录/game.exe' # 免安装游戏：**选主程序**�
 deck games add '<主程序>' --root ..     # 主程序在 bin/ 里、数据在上一层：连上一层一起拷
 deck games cover 'all'                 # 给库里的游戏生成封面：用 exe 自带的图标 + 标题（装完自动做）
 deck games fix '<名字>'                # 点开始没反应？重挑主程序 + 挪开游戏自带的 Windows 版 DXVK
-deck games pad --list                  # 手柄布局现状；pad <名字> -t mouse 让右摇杆当鼠标
 deck games shortcut <名字>             # 补登记（装完会自动登记）
 deck games rm <名字>                   # 卸载：Steam 条目 + 游戏本体（目录/prefix），一次清掉
 ```

@@ -18,34 +18,24 @@ set -uo pipefail
 SVC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_DIR="${SVC_DIR}/mac"
 DECK_DIR="${SVC_DIR}/deck"
+DECKKIT_ROOT="$(cd "$SVC_DIR/../.." && pwd)"
+# 颜色、消息、cfg、SSH 复用都在公共库（见 docs/约定.md §1）
+# shellcheck source=../../bin/deck-lib
+. "${DECKKIT_ROOT}/bin/deck-lib"
 
-if [ -t 1 ]; then
-  B=$'\033[1;36m'; G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; D=$'\033[2m'; N=$'\033[0m'
-else
-  B=; G=; Y=; R=; D=; N=; fi
-hdr()  { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
-ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
-warn() { printf '%s!%s %s\n' "$Y" "$N" "$*"; }
-die()  { printf '%s✗%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+DECK_HOST="$(deckkit_cfg_or DECK_HOST steamdeck.local)"
+DECK_SSH="$(deckkit_cfg_or DECK_SSH deck)"
+NFS_DIR="$(deckkit_cfg_or DECK_NFS_DIR /home/deck)"
+CLIENT_NET="$(deckkit_cfg_or CLIENT_NET 10.0.0.0/24)"
+MOUNT_POINT="$(deckkit_cfg_or MOUNT_POINT /Volumes/deck)"
+WEBDAV_PORT="$(deckkit_cfg_or WEBDAV_PORT 8088)"
+WEBDAV_UNIT="$(deckkit_cfg_or WEBDAV_UNIT rclone-webdav)"
+SSH_TIMEOUT="$(deckkit_cfg_or SSH_TIMEOUT 6)"
+deckkit_ssh_init
 
-# 从 config.env 取配置（不 source，避免污染环境）
-cfg_get() { sed -n "s/^$1=[\"']\{0,1\}\([^\"'#]*\).*/\1/p" "$MAC_DIR/config.env" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
-
-DECK_HOST="$(cfg_get DECK_HOST)";   DECK_HOST="${DECK_HOST:-steamdeck.local}"
-DECK_SSH="$(cfg_get DECK_SSH)";     DECK_SSH="${DECK_SSH:-deck}"
-NFS_DIR="$(cfg_get DECK_NFS_DIR)";  NFS_DIR="${NFS_DIR:-/home/deck}"
-CLIENT_NET="$(cfg_get CLIENT_NET)"; CLIENT_NET="${CLIENT_NET:-10.0.0.0/24}"
-MOUNT_POINT="$(cfg_get MOUNT_POINT)"; MOUNT_POINT="${MOUNT_POINT:-/Volumes/deck}"
-WEBDAV_PORT="$(cfg_get WEBDAV_PORT)"; WEBDAV_PORT="${WEBDAV_PORT:-8088}"
-WEBDAV_UNIT="$(cfg_get WEBDAV_UNIT)"; WEBDAV_UNIT="${WEBDAV_UNIT:-rclone-webdav}"
-
-# SSH 连接复用。一次刷新要开 6~8 个 SSH 连接（vitals + 每个服务 status 内部
-# 还有好几次），每次重新握手约 0.2 秒，累积起来就是菜单栏「更新慢半拍」的主因。
-# 实测：连续 3 次调用 0.56s → 0.07s。
-SSH_MUX=(-o ControlMaster=auto -o ControlPath="$HOME/.ssh/deckkit-cm-%r@%h:%p" -o ControlPersist=15s)
-SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=6 "${SSH_MUX[@]}")
-deck_sh()  { ssh "${SSH_OPTS[@]}" "$DECK_SSH" "$@"; }
-deck_sys() { deck_sh "export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}; systemctl --user $*"; }
+# 本服务的叫法沿用 deck_sh（更贴「跟 Deck 说话」这件事）
+deck_sh()  { rsh "$@"; }
+deck_sys() { rsh "export XDG_RUNTIME_DIR=\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}; systemctl --user $*"; }
 
 # ── 「期望状态」标记 ──
 # 用来区分两种「没挂上」：
@@ -57,13 +47,37 @@ WANT_FILE="${STATE_DIR}/files.want"
 want_get() { [ -f "$WANT_FILE" ] && cat "$WANT_FILE" 2>/dev/null; return 0; }
 want_set() { mkdir -p "$STATE_DIR" 2>/dev/null; printf '%s\n' "$1" > "$WANT_FILE" 2>/dev/null; return 0; }
 
-deck_online()   { deck_sh true 2>/dev/null; }
-mount_present() { mount | grep -q " on ${MOUNT_POINT} "; }
+deck_online()   { deck_up; }
+
+# 这个 NFS 源**实际**挂在哪儿（问 mount 表，不是问配置）。
+#
+# 为什么不能只比对 $MOUNT_POINT：Finder 的 `mount volume` 在目标名被占时
+# 会自己改成 `deck-1`（实测：卸载后紧接着挂，/Volumes/deck 还没来得及消失，
+# 于是就挂到了 /Volumes/deck-1）。而那时 /Volumes/deck 上什么也没有 ——
+# 旧代码只会报「挂载失败」，把「挂到别处去了」误诊成「没挂上」，
+# 用户对着一个空目录查半天。
+# 用 index() 而不是正则：源里带 / 和 . ，正则会踩坑。
+nfs_mount_point() {
+  mount 2>/dev/null | awk -v src="${DECK_HOST}:${NFS_DIR}" '
+    index($0, src " on ") == 1 { sub(/^.* on /, ""); sub(/ \(.*/, ""); print; exit }'
+}
+# rsh_put 只收绝对路径（远端 ~ 在引号里不展开，§9），所以先问一次 $HOME 并缓存
+DECK_HOME_CACHE=""
+deck_home() {
+  if [ -z "$DECK_HOME_CACHE" ]; then
+    DECK_HOME_CACHE="$(rsh 'printf %s "$HOME"' 2>/dev/null)"
+    [ -n "$DECK_HOME_CACHE" ] || die "问不到 Deck 的 \$HOME"
+  fi
+  printf '%s' "$DECK_HOME_CACHE"
+}
+# 挂上了 = 这个源在 mount 表里（**任何**挂载点都算）
+mount_present() { [ -n "$(nfs_mount_point)" ]; }
 
 # 挂载点存在但没响应 = Deck 睡了留下的陈旧挂载（stat 会一直阻塞，所以要带闹钟）
 mount_alive() {
-  mount_present || return 1
-  python3 - "$MOUNT_POINT" <<'PY' 2>/dev/null
+  local mp; mp="$(nfs_mount_point)"
+  [ -n "$mp" ] || return 1
+  python3 - "$mp" <<'PY' 2>/dev/null
 import os, signal, sys
 signal.signal(signal.SIGALRM, lambda *a: sys.exit(1)); signal.alarm(3)
 try: os.stat(sys.argv[1])
@@ -87,8 +101,9 @@ cmd_status() {
   mount_present && mounted=1
   mount_alive && alive=1
 
+  local mp; mp="$(nfs_mount_point)"
   if [ "$alive" = 1 ]; then
-    printf '%s✓%s 已挂载 %s ← %s:%s\n' "$G" "$N" "$MOUNT_POINT" "$DECK_HOST" "$NFS_DIR"
+    printf '%s✓%s 已挂载 %s ← %s:%s\n' "$G" "$N" "${mp:-$MOUNT_POINT}" "$DECK_HOST" "$NFS_DIR"
   elif [ "$mounted" = 1 ]; then
     printf '%s!%s %s 已挂载但无响应（Deck 可能睡了）\n' "$Y" "$N" "$MOUNT_POINT"
   elif [ "$(want_get)" = "off" ]; then
@@ -125,9 +140,11 @@ cmd_status() {
 # 清掉「挂着但没响应」的陈旧挂载 —— Deck 睡过之后最常见。
 # 用户级 umount 对卡死的 NFS 常常无效，所以再补一次 diskutil 的强制卸载；
 # 还是清不掉就只能人工 sudo（那种情况内核已经把这个挂载点锁住了）。
+# 作用在**实际挂载点**上：源可能被 Finder 挂到了 deck-1 那种地方（见 nfs_mount_point）。
 clear_stale_mount() {
-  umount "$MOUNT_POINT" 2>/dev/null \
-    || diskutil unmount force "$MOUNT_POINT" >/dev/null 2>&1 \
+  local mp; mp="$(nfs_mount_point)"; [ -n "$mp" ] || mp="$MOUNT_POINT"
+  umount "$mp" 2>/dev/null \
+    || diskutil unmount force "$mp" >/dev/null 2>&1 \
     || true
   sleep 1
   mount_present && return 1
@@ -135,6 +152,56 @@ clear_stale_mount() {
 }
 
 # ----------------------------------------------------------------- mount ---
+# 实际挂一次。cmd_mount（用户手动）和 cmd_ensure（每轮自愈）走的是同一段 ——
+# 以前这两处各写一遍，改一处忘一处（比如"先探 2049 再调 osascript"这条
+# 就只在其中一处有）。
+mount_now() {
+  # 先探 2049：对着没开 NFS 的主机调 osascript 会干等 40 多秒（实测 46s）
+  nfs_port_open || { warn "Deck 的 NFS 端口 2049 没开。先在 Mac 上跑：deck files provision"; return 1; }
+
+  # 名字被占的话 Finder 会挂到 deck-1（见 nfs_mount_point），所以先让位：
+  # 只在 $MOUNT_POINT 存在、且**不是**本源的挂载点时才动，而且只删空目录 ——
+  # 里面有东西就当它是用户的真实数据，绝不碰（约定 §6）。
+  if [ -d "$MOUNT_POINT" ] && [ "$(nfs_mount_point)" != "$MOUNT_POINT" ]; then
+    if rmdir "$MOUNT_POINT" 2>/dev/null; then
+      dim "  清掉挡名字的空目录 $MOUNT_POINT"
+    else
+      warn "$MOUNT_POINT 被占用（不是本源的挂载点，且非空）—— Finder 可能挂到 ${MOUNT_POINT}-1"
+    fi
+  fi
+
+  finder_mount
+  local mp; mp="$(nfs_mount_point)"
+  # 落在别处、而配置的那个名字现在空着 → 收掉重挂一次。
+  # 这是实测出来的：`umount` 刚返回时内核里那条 autofs 记录还没消失，
+  # Finder 就以为名字被占、于是挂到 deck-1；隔一秒再挂就正常了。
+  if [ -n "$mp" ] && [ "$mp" != "$MOUNT_POINT" ] && [ ! -d "$MOUNT_POINT" ]; then
+    warn "先落在了 ${mp}（${MOUNT_POINT} 一时没让开），收掉重挂一次"
+    umount "$mp" 2>/dev/null || diskutil unmount force "$mp" >/dev/null 2>&1 || true
+    sleep 1
+    finder_mount
+    mp="$(nfs_mount_point)"
+  fi
+  [ -n "$mp" ] || return 1
+  if [ "$mp" != "$MOUNT_POINT" ]; then
+    # 挂上了，但不在配置的路径上 —— 必须说清楚，别报「没挂上」
+    warn "Finder 把它挂到了 ${mp}（配置里是 ${MOUNT_POINT}；名字被占时 Finder 会自动加 -1）"
+  fi
+  mount_alive
+}
+
+# 让 Finder 挂，然后等它出现在 mount 表里。
+# 挂载不是瞬时的：轮询而不是死等固定秒数（Finder 那条路要跟 NetAuthSysAgent 说话，
+# 慢的时候 2 秒真不够，然后就报「挂载失败」）。
+finder_mount() {
+  osascript -e "mount volume \"nfs://${DECK_HOST}${NFS_DIR}\"" >/dev/null 2>&1
+  local i=0
+  while [ "$i" -lt 16 ]; do
+    [ -n "$(nfs_mount_point)" ] && return 0
+    sleep 0.5; i=$((i + 1))
+  done
+  return 1
+}
 cmd_mount() {
   deck_online || die "Deck 离线（${DECK_HOST}），先把它唤醒"
   want_set on                          # 记下「用户要它挂着」
@@ -145,12 +212,9 @@ cmd_mount() {
     warn "检测到陈旧挂载（Deck 睡过留下的），先尝试清掉"
     clear_stale_mount || die "陈旧挂载清不掉，需要人工：sudo umount -f '$MOUNT_POINT'"
   fi
-  # 先探 2049：对着没开 NFS 的主机调 osascript 会干等 40 多秒（实测 46s）
-  nfs_port_open || die "Deck 的 NFS 端口 2049 没开。先在 Mac 上跑：deck files provision"
   echo "… 通过访达挂载 nfs://${DECK_HOST}${NFS_DIR}"
-  osascript -e "mount volume \"nfs://${DECK_HOST}${NFS_DIR}\"" >/dev/null 2>&1
-  sleep 2
-  if mount_alive; then ok "挂载成功：$MOUNT_POINT"; else die "挂载失败。可试 Finder cmd+K → nfs://${DECK_HOST}${NFS_DIR}"; fi
+  if mount_now; then ok "挂载成功：$(nfs_mount_point)"
+  else die "挂载失败。可试 Finder cmd+K → nfs://${DECK_HOST}${NFS_DIR}"; fi
 }
 
 cmd_unmount() {
@@ -175,10 +239,7 @@ cmd_ensure() {
     warn "检测到陈旧挂载，尝试强制卸载"
     clear_stale_mount || { warn "陈旧挂载清不掉，需要手动：sudo umount -f ${MOUNT_POINT}"; return 1; }
   fi
-  nfs_port_open || { warn "NFS 端口 2049 未开放，先跑 deck files provision"; return 1; }
-  osascript -e "mount volume \"nfs://${DECK_HOST}${NFS_DIR}\"" >/dev/null 2>&1
-  sleep 2
-  if mount_alive; then ok "已自动挂载 ${MOUNT_POINT}"; return 0; fi
+  if mount_now; then ok "已自动挂载 ${MOUNT_POINT}"; return 0; fi
   warn "自动挂载失败（Deck 可能刚醒，稍后会重试）"
   return 1
 }
@@ -194,9 +255,8 @@ cmd_toggle() {
 cmd_caps() { printf 'ensure\ntoggle 挂载 / 卸载\n'; }
 
 cmd_open() {
-  if mount_alive; then open "$MOUNT_POINT"
-  elif [ -d "$MOUNT_POINT" ]; then open "$MOUNT_POINT"
-  else open /Volumes; fi
+  # 挂载点在就打开它；不在就打开 /Volumes（让用户自己看见缺了什么）
+  if [ -d "$MOUNT_POINT" ]; then open "$MOUNT_POINT"; else open /Volumes; fi
 }
 
 cmd_url() {
@@ -211,17 +271,12 @@ cmd_provision() {
   local script="$DECK_DIR/provision-root.sh"
   [ -f "$script" ] || die "找不到 $script"
   hdr "把 provision 脚本传到 Deck"
-  deck_sh 'mkdir -p ~/deckkit/services/files' || die "连不上 Deck"
-  scp -q "${SSH_OPTS[@]}" "$script" "$DECK_SSH:~/deckkit/services/files/provision-root.sh" || die "传输失败"
+  rsh_put "$script" "$(deck_home)/deckkit/services/files/provision-root.sh" || die "传输失败"
   ok "已传输"
   hdr "在 Deck 上执行（需要免密 sudo）"
-  # 只有交互终端才加 -t：免密 sudo 已配置时不需要 TTY，
-  # 而没有终端的环境（CI / 菜单栏调用）带 -t 会直接失败。
-  # 用标量而不是数组：bash 3.2 在 set -u 下展开空数组会报 unbound variable。
-  local tty_opt=""
-  [ -t 0 ] && tty_opt="-t"
-  ssh $tty_opt "${SSH_OPTS[@]}" "$DECK_SSH" \
-    "sudo DECK_NFS_DIR='$NFS_DIR' DECK_NFS_NET='$CLIENT_NET' bash ~/deckkit/services/files/provision-root.sh $*"
+  # -t 只在交互终端加（免密 sudo 已配置时不需要 TTY，而没有终端的环境带 -t
+  # 会直接失败）—— rsh_tty 自己判断。
+  rsh_tty "sudo DECK_NFS_DIR=$(printf '%q' "$NFS_DIR") DECK_NFS_NET=$(printf '%q' "$CLIENT_NET") bash \"\$HOME/deckkit/services/files/provision-root.sh\" $*"
 }
 
 # ---------------------------------------------------------------- webdav ---
@@ -240,8 +295,7 @@ cmd_webdav() {
       # 直接在 Deck 上重写单元是无迹可循的；以仓库里的 .service 为准。
       local unit_src="$DECK_DIR/rclone-webdav.service"
       [ -f "$unit_src" ] || die "找不到 $unit_src"
-      deck_sh 'mkdir -p ~/.config/systemd/user' || die "连不上 Deck"
-      scp -q "${SSH_OPTS[@]}" "$unit_src" "$DECK_SSH:~/.config/systemd/user/${WEBDAV_UNIT}.service" || die "传输失败"
+      rsh_put "$unit_src" "$(deck_home)/.config/systemd/user/${WEBDAV_UNIT}.service" || die "传输失败"
       deck_sys "daemon-reload" >/dev/null
       deck_sys "enable --now $WEBDAV_UNIT" || die "启用失败"
       sleep 1

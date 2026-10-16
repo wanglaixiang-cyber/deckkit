@@ -10,6 +10,7 @@
 #    deck root <命令>        以 root 在 Deck 上执行（需要免密 sudo 已授权）
 #    deck push <本地> <远端>  传文件到 Deck
 #    deck menu [--run|--install|--dev]  编译菜单栏 App（--install 装到 /Applications）
+#    deck logs [来源|all] [行数]  看日志（默认菜单栏；-f 实时跟，--list 列出所有来源）
 #    deck brief             精简状态：一个服务一行（完整：deck status）
 #    deck vitals [--json]    读 Deck 电量 / 充电状态 / 温度 / 运行时长
 #    deck self-install       把 deck 放进 PATH（之后任意目录直接敲 deck）
@@ -33,25 +34,18 @@ done
 ROOT="$(cd -P "$(dirname "$_self")/.." && pwd)"
 SERVICES_DIR="${ROOT}/services"
 
+# 公共库：颜色、say/hdr/ok/warn/bad/die、usage、cfg、SSH 复用、rsh/rsh_put…
+# 都在 bin/deck-lib 里 —— 4 个服务入口 + 这里以前各抄了一份（见约定 §1）。
+DECKKIT_ROOT="$ROOT"
+# shellcheck source=deck-lib
+. "${ROOT}/bin/deck-lib"
+
 # Deck 连接参数（可用环境变量覆盖）
 DECK_HOST="${DECKKIT_DECK_HOST:-steamdeck.local}"
 DECK_SSH="${DECKKIT_DECK_SSH:-deck}"          # ~/.ssh/config 里的别名
-
-# SSH 连接复用。一次刷新要开 6~8 个 SSH 连接（vitals + 每个服务 status 内部
-# 还有好几次），每次重新握手约 0.2 秒，累积起来就是菜单栏「更新慢半拍」的主因。
-# 实测：连续 3 次调用 0.56s → 0.07s。
-SSH_MUX=(-o ControlMaster=auto -o ControlPath="$HOME/.ssh/deckkit-cm-%r@%h:%p" -o ControlPersist=15s)
-
-if [ -t 1 ]; then
-  B=$'\033[1;36m'; G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; D=$'\033[2m'; N=$'\033[0m'
-else
-  B=; G=; Y=; R=; D=; N=
-fi
-say()  { printf '%s\n' "$*"; }
-hdr()  { printf '\n%s%s%s\n' "$B" "$*" "$N"; }
-ok()   { printf '%s✓%s %s\n' "$G" "$N" "$*"; }
-warn() { printf '%s!%s %s\n' "$Y" "$N" "$*"; }
-die()  { printf '%s✗%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+SSH_TIMEOUT="${SSH_TIMEOUT:-6}"
+deckkit_ssh_init
+usage() { deckkit_usage_of "$0"; }
 
 services() {
   local d
@@ -72,7 +66,6 @@ svc_desc() {
 
 svc_entry() { printf '%s/%s/service' "$SERVICES_DIR" "$1"; }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \?//'; }
 
 # 把 deck 放到 PATH 上（软链到 ~/.local/bin 或 /usr/local/bin，必要时写 ~/.zshrc）
 cmd_self_install() {
@@ -102,16 +95,14 @@ cmd_self_install() {
 
 # 每个服务最常用的命令（服务自己的 help 优先，没有就从用法注释里挑"deck xxx"那几行）
 cmd_cmds() {
-  local root; root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  local d name desc body
-  for d in "$root"/services/*/; do
-    name="$(basename "$d")"; [ -f "$d/service" ] || continue
-    desc=""; [ -f "$d/SERVICE.md" ] && desc="$(sed -n '1s/^# *//p' "$d/SERVICE.md")"
-    printf '\n  \033[1m%s\033[0m' "$name"
-    [ -n "$desc" ] && printf '  \033[2m%s\033[0m' "$desc"
+  local name desc body
+  for name in $(services); do
+    desc="$(svc_desc "$name")"
+    printf '\n  %s%s%s' "$C_B" "$name" "$C_RST"
+    [ -n "$desc" ] && printf '  %s%s%s' "$C_DIM" "$desc" "$C_RST"
     printf '\n'
-    body="$( "$d/service" help 2>/dev/null || true )"
-    [ -n "$body" ] || body="$(sed -n '2,30p' "$d/service" | sed -n 's/^# *//p')"
+    body="$( "$(svc_entry "$name")" help 2>/dev/null || true )"
+    [ -n "$body" ] || body="$(deckkit_usage_of "$(svc_entry "$name")")"
     # 统一只留命令行（各服务的 help/用法注释脏瘦不一，这里过滤 + 限制条数，
     # 保证每段都整齐；详细说明让用户跑 deck <服务> help）
     printf '%s\n' "$body" | sed 's/^[[:space:]]*#[[:space:]]*//' \
@@ -134,6 +125,10 @@ cmd_list() {
 
 # 精简状态：一行一个服务（终端里的游戏管理页顶部用的就是它，也是"不想看全量"时的一条命令）。
 # 想好看全量：deck status
+# 取服务 status 的第一行非空内容（去掉缩进）。deck overview / brief / 菜单栏
+# 都要这一口，三处各写一条 sed 是同一件事的第三份拷贝。
+svc_first_line() { "$1" status 2>/dev/null | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}'; }
+
 cmd_brief() {
   local s e d out
   # 并行取：每个服务一次 status（各自还要 ssh），串行时 4 个服务要 ~10 秒，
@@ -142,7 +137,7 @@ cmd_brief() {
   for s in $(services); do
     e="$(svc_entry "$s")"
     if [ -x "$e" ]; then
-      ( "$e" status 2>/dev/null | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}' > "$d/$s" ) &
+      ( svc_first_line "$e" > "$d/$s" ) &
     else
       printf '%s(没有 service 入口)%s' "$D" "$N" > "$d/$s"
     fi
@@ -161,7 +156,7 @@ cmd_overview() {
   hdr "deckkit"
   printf '  根目录    %s\n' "$ROOT"
   printf '  Deck      %s  (%s)\n' "$DECK_HOST" "$DECK_SSH"
-  if ssh "${SSH_MUX[@]}" -o BatchMode=yes -o ConnectTimeout=6 "$DECK_SSH" true 2>/dev/null; then
+  if deck_up; then
     printf '  连通性    %s在线%s\n' "$G" "$N"
   else
     printf '  连通性    %s离线%s\n' "$R" "$N"
@@ -173,7 +168,7 @@ cmd_overview() {
     e="$(svc_entry "$s")"
     if [ -x "$e" ]; then
       # 取 status 的第一行非空内容当摘要
-      out="$("$e" status 2>/dev/null | sed -n '/[^[:space:]]/{s/^[[:space:]]*//;p;q;}')"
+      out="$(svc_first_line "$e")"
       printf '  %-12s %s\n' "$s" "${out:-—}"
     else
       printf '  %-12s %s(没有 service 入口)%s\n' "$s" "$D" "$N"
@@ -207,8 +202,8 @@ cmd_doctor() {
     fi
   }
 
-  chk "Deck 可达"        "ssh ${SSH_MUX[*]} -o BatchMode=yes -o ConnectTimeout=6 $DECK_SSH true" "检查 Deck 是否开机、SSH 是否开着"
-  chk "Deck 免密 sudo"   "ssh ${SSH_MUX[*]} -o BatchMode=yes $DECK_SSH 'sudo -n true'" "见 docs/约定.md §4（root 操作要用）"
+  chk "Deck 可达"        "deck_up" "检查 Deck 是否开机、SSH 是否开着"
+  chk "Deck 免密 sudo"   "rsh 'sudo -n true'" "见 docs/约定.md §4（root 操作要用）"
   chk "swiftc 可用"      "command -v swiftc" "xcode-select --install（编译菜单栏 App 用）" soft
   chk "菜单栏 App 已编译" "[ -d '$ROOT/menubar/DeckKit.app' ]" "deck menu" soft
   chk "菜单栏能正常出菜单" "[ -x '$ROOT/menubar/DeckKit.app/Contents/MacOS/DeckKit' ] && '$ROOT/menubar/DeckKit.app/Contents/MacOS/DeckKit' --dump | grep -q 'Steam Deck'" "deck menu 重新编译" soft
@@ -217,13 +212,15 @@ cmd_doctor() {
 
   # 全角字符紧跟 $VAR：macOS 自带 bash 3.2 会把全角标点的字节吃进变量名，
   # 运行时报 "unbound variable" —— 而且只在带中文字符串的那一行炸。
-  # 这个坑已经踩过 6 次，所以放进体检里自动扫（见 docs/约定.md §7）。
+  # 这个坑已经踩过 6 次，所以放进体检里自动扫（见 docs/约定.md §9）。
   # 只看代码行：纯注释里的举例不算。
   local hits="" f hit
   for f in "$ROOT/bin/deck" "$SERVICES_DIR"/*/service "$SERVICES_DIR"/*/mac/*.env \
            "$SERVICES_DIR"/*/deck/*.sh "$ROOT/menubar/build.sh"; do
     [ -f "$f" ] || continue
-    hit="$(perl -ne 'next if m{^\s*#}; print "行 $.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7f])/' "$f" 2>/dev/null | head -3)"
+    # 不截断（以前 `| head -3` 会把同一个文件里第 4 处之后的都藏起来，
+    # 修完前 3 处、再跑一次才发现还有 9 处 —— 门禁要么全绿要么列出全部）
+    hit="$(perl -ne 'next if m{^\s*#}; print "行 $.: $_" if /\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7f])/' "$f" 2>/dev/null)"
     [ -n "$hit" ] && hits="${hits}${f}:
 ${hit}
 "
@@ -236,6 +233,38 @@ ${hit}
     ok "脚本里没有「变量紧跟全角字符」"
   fi
 
+  # 脚本首行必须是 shebang。**不是的话命令行里看不出来**：bash 执行一个不是
+  # 可执行格式的文件时会自己回退成「按脚本读一遍」（POSIX 的 ENOEXEC 回退），
+  # 于是 `./bin/deck files status` 一切正常 —— 而用 posix_spawn 的调用方
+  # （菜单栏 App）拿到的是 ENOEXEC，症状是那一行永远显示
+  # 「启动失败：Exec format error」，而且**会一直停在那儿**（真踩过：
+  # 一次按索引改脚本时，把新代码插到了文件最前面，shebang 被挤到第 49 行）。
+  # 同一个坑还有第二种长相：同名函数定义了两次 —— 后者生效，看着改好了其实没有。
+  local scripts="" bad_first="" dup_def="" first dup
+  for f in "$ROOT/bin/deck" "$ROOT/bin/deck-lib" "$ROOT/bin/deck-log" \
+           "$SERVICES_DIR"/*/service "$SERVICES_DIR"/*/deck/*.sh \
+           "$SERVICES_DIR"/*/mac/*.sh "$ROOT/menubar/build.sh"; do
+    [ -f "$f" ] || continue
+    scripts="$scripts $f"
+    first="$(head -c 2 "$f" 2>/dev/null)"
+    [ "$first" = "#!" ] || bad_first="${bad_first}${f}\n"
+    dup="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*\(\) \{' "$f" 2>/dev/null | sort | uniq -d | tr '\n' ' ')"
+    [ -n "$dup" ] && dup_def="${dup_def}${f}: ${dup}\n"
+  done
+  if [ -n "$bad_first" ]; then
+    printf '%s✗%s %s\n' "$R" "$N" "脚本首行不是 shebang（命令行看不出问题，App 会 ENOEXEC）："
+    printf '%b' "$bad_first" | sed 's/^/      /'
+    bad=1
+  else
+    ok "所有脚本首行都是 shebang"
+  fi
+  if [ -n "$dup_def" ]; then
+    printf '%s!%s %s\n' "$Y" "$N" "同名函数定义了两次（后者生效，容易「改了个寂寞」）："
+    printf '%b' "$dup_def" | sed 's/^/      /'
+  else
+    ok "没有重复定义的函数"
+  fi
+
   echo
   printf '%s具体服务各自的依赖，由 deck status 里对应那行反映。%s\n' "$D" "$N"
   [ "$bad" = 0 ] && ok "没有硬性缺项" || warn "有硬性缺项，见上面 ✗"
@@ -246,6 +275,65 @@ cmd_menu() {
   local script="$ROOT/menubar/build.sh"
   [ -x "$script" ] || die "找不到 $script"
   exec "$script" "$@"
+}
+
+# logs [来源|all] [行数]  |  logs -f [来源]  |  logs --list
+#
+# 统一入口：所有日志都经 bin/deck-log 写（位置/格式/滚动定在一处），
+# 这里只负责「读」。以前这里写死了 menubar.log 一个路径，
+# 别的日志散在 <服务>-web.log / installer.log / install.log 各自为政，
+# 排查第一步变成了「先找日志在哪」。
+cmd_logs() {
+  local tool="$ROOT/bin/deck-log"
+  [ -x "$tool" ] || die "找不到 $tool"
+  local follow=0 which="" n=40 a
+  for a in "$@"; do
+    case "$a" in
+      -f|--follow) follow=1 ;;
+      --list|-l)   exec "$tool" --list ;;
+      *) if [ -z "$which" ]; then which="$a"; else n="$a"; fi ;;
+    esac
+  done
+  case "${which:-}" in ""|菜单栏) which="menubar" ;; esac
+  case "${n:-40}" in ''|*[!0-9]*) n=40 ;; esac
+
+  # all：把每个源加上来源前缀后按**时间戳**合并 —— 前缀必须排在时间戳之后，
+  # 否则 sort 会按来源名排，时间线就废了。只认统一格式的行（时间戳开头），
+  # 流式日志里 node/proton 的原始输出没有时间戳，混进来只会污染排序。
+  if [ "$which" = "all" ]; then
+    local d f base; d="$("$tool" --dir)"
+    [ -d "$d" ] || die "还没有日志目录：$d"
+    for f in "$d"/*.log; do
+      [ -f "$f" ] || continue
+      base="$(basename "$f" .log)"
+      grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}  ' "$f" 2>/dev/null \
+        | sed -E "s/^(.{19})  /\1  [${base}] /"
+    done | sort | tail -n "$n"
+    return 0
+  fi
+
+  local f; f="$("$tool" --path "$which")"
+  if [ -f "$f" ]; then
+    if [ "$follow" = 1 ]; then exec tail -n "$n" -f "$f"; fi
+    say "${B}${which}${N}  $f"
+    tail -n "$n" "$f"
+    return 0
+  fi
+
+  # 本地没有这个源 —— Deck 侧服务的日志写在 Deck 上（~/deckkit/logs/）。
+  # 没必要同步回来（日志是量的东西，同步只会制造两份状态），直接 tail 一次。
+  # 只在本地缺失时才多这一趟 SSH，所以正常读 Mac 侧日志不受影响。
+  local base; base="$(basename "$f" .log)"
+  local remote
+  remote="$(rsh "f=\"\$HOME/deckkit/logs/${base}.log\"; if [ -f \"\$f\" ]; then echo \"--- Deck \$f ---\"; tail -n ${n} \"\$f\"; fi" 2>/dev/null || true)"
+  if [ -n "$remote" ]; then printf '%s\n' "$remote"; return 0; fi
+
+  # 统一源里还没有这个文件：退回服务自己的 logs 子命令（过渡期兼容，
+  # 等所有服务都迁到 deck-log 之后这段就能删）。
+  local e; e="$(svc_entry "$which" 2>/dev/null || true)"
+  if [ -n "$e" ] && [ -x "$e" ]; then exec "$e" logs "$n"; fi
+  say "还没有日志：$f"
+  say "${D}（本地和 Deck 上都没有这个来源；deck logs --list 看有哪些）${N}"
 }
 
 # ── 服务自愈 / 主状态切换 ──
@@ -287,30 +375,30 @@ cmd_toggle() {
   esac
 }
 
-cmd_ssh()  { exec ssh "${SSH_MUX[@]}" "$DECK_SSH" "$@"; }
+cmd_ssh()  { exec ssh "${SSH_TTY_OPTS[@]}" "$DECKKIT_SSH_TARGET" "$@"; }
+# root 走 -t：要输密码/看提示的场合得有终端（只有交互终端才加，§9）
 cmd_root() {
   [ $# -gt 0 ] || die "用法：deck root <命令>"
-  exec ssh -t "${SSH_MUX[@]}" "$DECK_SSH" "sudo $*"
+  exec ssh -t "${SSH_TTY_OPTS[@]}" "$DECKKIT_SSH_TARGET" "sudo $*"
 }
 cmd_push() {
   [ $# -eq 2 ] || die "用法：deck push <本地文件> <Deck上路径>"
   local src="$1" dst="$2"
   case "$dst" in
     '~'|'~/'*)
-      # scp 走 SFTP，不展开 ~（docs/约定.md §7）。远端 home 让 Deck 自己报，
+      # scp 走 SFTP，不展开 ~（docs/约定.md §9）。远端 home 让 Deck 自己报，
       # 别在本地猜 —— 走复用的 SSH 连接，一次往返约 0.05 秒。
       # 也不能把 '~/...' 交给远端脚本自己剥：bash 对 "${p#~/}" 里的 word
       # 也会做 tilde 展开（展开成 $HOME/ 于是匹配不上），得写 "${p#\~}"。
-      local home; home="$(ssh "${SSH_MUX[@]}" "$DECK_SSH" 'printf %s "$HOME"' 2>/dev/null)"
+      local home; home="$(rsh 'printf %s "$HOME"' 2>/dev/null)"
       [ -n "$home" ] || die "问不到 Deck 的 \$HOME"
       dst="${home}${dst#\~}"
-      local base; base="$(basename "$dst")"
-      scp "${SSH_MUX[@]}" "$src" "${DECK_SSH}:/tmp/deckkit-push-${base}" || exit 1
-      exec ssh "${SSH_MUX[@]}" "$DECK_SSH" \
-        "mkdir -p \"\$(dirname '$dst')\" && mv '/tmp/deckkit-push-${base}' '$dst' && echo \"✓ 已放到 $dst\""
       ;;
   esac
-  exec scp "${SSH_MUX[@]}" "$src" "${DECK_SSH}:$dst"
+  # 落地方式统一走 rsh_put（先 /tmp 再 mv）：目标目录不存在也能上传，
+  # 上传中途断掉不会在目标位置留半截文件。
+  rsh_put "$src" "$dst" || die "上传失败：$src → $dst"
+  ok "已放到 $dst"
 }
 
 # 秒 → 人类可读时长
@@ -322,6 +410,11 @@ fmt_dur() {
   else printf '%d分钟' "$m"; fi
 }
 
+# JSON 字符串转义（ssh 的报错里会出现引号 / 反斜杠 / 换行，直接塞进 json 会把它弄坏）
+_jesc() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\n\r'
+}
+
 # ── Deck 遥测：电量 / 充电状态 / 温度 / 运行时长 ──
 # 全部读 sysfs，一次 SSH 拿完。菜单栏用 --json 调它，
 # 所以「Deck 在不在线」和「电量温度」是同一趟往返，不会翻倍等待。
@@ -330,9 +423,16 @@ cmd_vitals() {
   [ "${1:-}" = "--json" ] && json=1
 
   # 注意：这段远程脚本里刻意不用 case 语句 —— macOS 自带 bash 3.2 在
-  # "$( ... <<'EOF' ... EOF )" 里遇到 `case ... *)` 会解析错乱（见 docs/约定.md §7）。
-  local raw rc
-  raw="$(ssh "${SSH_MUX[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$DECK_SSH" 'bash -s' <<'REMOTE' 2>/dev/null
+  # "$( ... <<'EOF' ... EOF )" 里遇到 `case ... *)` 会解析错乱（见 docs/约定.md §9）。
+  # ssh 的 stderr 单独收着（以前是 2>/dev/null）：菜单栏日志里那行「状态 → 离线」
+  # 必须能说出**为什么**。光有「输出=(空)」分不清是连接出问题还是真连不上。
+  local errf; errf="$(mktemp -t deckkit-vitals 2>/dev/null || true)"
+  _vitals_ssh() {   # $1 = ConnectTimeout；$2 = nomux（绕开复用、直连）
+    # nomux 用 ControlPath=none + ControlMaster=no 彻底关掉多路复用：
+    # 第二次探测要的是「一条与那个共享 socket 无关的连接」。
+    local _mux=("${SSH_MUX[@]}")
+    [ "${2:-}" = "nomux" ] && _mux=(-o ControlMaster=no -o ControlPath=none)
+    ssh "${_mux[@]}" -o BatchMode=yes -o ConnectTimeout="$1" "$DECKKIT_SSH_TARGET" 'bash -s' 2>"${errf:-/dev/null}" <<'REMOTE'
 cap=""; bstat=""; ac=""
 for d in /sys/class/power_supply/*/; do
   [ -d "$d" ] || continue
@@ -364,17 +464,49 @@ echo "btemp=$btemp"
 echo "uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null)"
 echo "load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)"
 REMOTE
-)"
-  rc=$?
+  }
+
+  # 单次失败不足以说明「Deck 离线」。实测两种失败长相，必须区分：
+  #   · 0.1~0.5s 秒回 + 输出空：跟主机在不在线无关（大概率出在多路复用这条路上）
+  #   · 踩满 ConnectTimeout：是真的不通
+  # 所以重试一次，两次都失败才认账。
+  #
+  # 关键：第二次**绕开复用直连**，而不是先 `ssh -O exit` 把旧 socket 拆掉再走复用。
+  # 为什么改（实测）：
+  #   · 那个 socket 是所有并发调用**共用一个文件**。A 正在跑 `sleep 5`，B 一发
+  #     `ssh -O exit`，A 的会话当场被打断、输出全丢（B 还回一句 "Exit request sent."）。
+  #     菜单栏日志里「状态 → 离线」和「服务 x → （没有输出）」出现在同一轮，就是这么来的。
+  #   · 直连是**独立**的一次判断：不走复用就完全不受那个 socket 状态的影响 ——
+  #     比「先清理再复用」更贴近「换个方式再问一遍」的本意，也不伤别人。
+  local raw rc try
+  raw=""; rc=1
+  for try in 1 2; do
+    if [ "$try" = 1 ]; then
+      raw="$(_vitals_ssh 5)"; rc=$?
+    else
+      raw="$(_vitals_ssh 3 nomux)"; rc=$?
+    fi
+    if [ "$rc" -eq 0 ] && [ -n "$raw" ]; then break; fi
+  done
 
   vget() { printf '%s\n' "$raw" | sed -n "s/^$1=//p" | head -1; }
   # 毫摄氏度 → 摄氏度（一位小数）；空值给 null
   deg() { if [ -n "${1:-}" ]; then awk -v m="$1" 'BEGIN{printf "%.1f", m/1000}'; else printf 'null'; fi; }
 
   if [ "$rc" -ne 0 ] || [ -z "$raw" ]; then
-    if [ "$json" = 1 ]; then printf '{"online":false}\n'; else die "Deck（${DECK_SSH}）不可达"; fi
+    # 把失败原因原样带出去：菜单栏把这段 json 整条写进日志，
+    # 于是「为什么判成离线」在日志里就是自证的，不用事后靠猜。
+    local why
+    why="$(tr -d '\r' < "${errf:-/dev/null}" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-200)"
+    if [ -n "${errf:-}" ]; then rm -f "$errf"; fi
+    if [ "$json" = 1 ]; then
+      printf '{"online":false,"rc":%s,"why":"%s"}\n' "$rc" "$(_jesc "$why")"
+    else
+      die "Deck（${DECK_SSH}）不可达${why:+：$why}"
+    fi
     return 0
   fi
+  if [ -n "${errf:-}" ]; then rm -f "$errf"; fi
 
   local cap bstat ac apu btemp up load1
   cap="$(vget cap)"; bstat="$(vget bstat)"; ac="$(vget ac)"
@@ -418,6 +550,7 @@ case "${1:-}" in
   root)               shift; cmd_root "$@" ;;
   push)               shift; cmd_push "$@" ;;
   menu|menubar)       shift; cmd_menu "$@" ;;
+  logs|log)           shift; cmd_logs "$@" ;;
   vitals)             shift; cmd_vitals "$@" ;;
   ensure)             shift; cmd_ensure "$@" ;;
   toggle)             shift; cmd_toggle "$@" ;;

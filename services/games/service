@@ -32,52 +32,32 @@ set -uo pipefail
 SVC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAC_DIR="${SVC_DIR}/mac"
 DECK_DIR="${SVC_DIR}/deck"
+DECKKIT_ROOT="$(cd "$SVC_DIR/../.." && pwd)"
+# 颜色 / 消息 / cfg / SSH 复用 / rsh / slug … 都在公共库（约定 §1）：
+# 这四个服务入口以前各抄了一份，改一处要记得改四处。
+# shellcheck source=../../bin/deck-lib
+. "${DECKKIT_ROOT}/bin/deck-lib"
 
-cfg_get() { sed -n "s/^$1=[\"']\{0,1\}\([^\"'#]*\).*/\1/p" "$MAC_DIR/config.env" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
-
-DECK_SSH="$(cfg_get DECK_SSH)";           DECK_SSH="${DECK_SSH:-deck}"
-DECK_HOST="$(cfg_get DECK_HOST)";         DECK_HOST="${DECK_HOST:-steamdeck.local}"
-DECK_GAMES_ROOT="$(cfg_get DECK_GAMES_ROOT)"; DECK_GAMES_ROOT="${DECK_GAMES_ROOT:-~/deckkit/services/games}"
-DECK_HOME="$(cfg_get DECK_HOME)"; DECK_HOME="${DECK_HOME:-/home/deck}"
-# 传给 scp / 远端脚本的**文件路径用绝对路径**：scp 现在走 SFTP，远端 ~ 不一定展开
+DECK_SSH="$(deckkit_cfg_or DECK_SSH deck)"
+DECK_HOST="$(deckkit_cfg_or DECK_HOST steamdeck.local)"
+DECK_GAMES_ROOT="$(deckkit_cfg_or DECK_GAMES_ROOT '~/deckkit/services/games')"
+DECK_HOME="$(deckkit_cfg_or DECK_HOME /home/deck)"
+# 传给远端脚本的**文件路径用绝对路径**：引号里的远端 ~ 不展开（§9）
 DECK_GAMES_ABS="$DECK_HOME/deckkit/services/games"
-SSH_TIMEOUT="$(cfg_get SSH_TIMEOUT)";     SSH_TIMEOUT="${SSH_TIMEOUT:-10}"
-KEEP_INSTALLER_ON_DECK="$(cfg_get KEEP_INSTALLER_ON_DECK)"
+SSH_TIMEOUT="$(deckkit_cfg_or SSH_TIMEOUT 10)"
+KEEP_INSTALLER_ON_DECK="$(deckkit_cfg_or KEEP_INSTALLER_ON_DECK '')"
+deckkit_ssh_init
 
-if [ -t 1 ]; then
-  C_RST=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
-else C_RST=""; C_B=""; C_DIM=""; C_RED=""; C_GRN=""; C_YEL=""; fi
-say()  { printf '%s\n' "$*"; }
-hdr()  { printf '\n%s%s%s\n' "$C_B" "$*" "$C_RST"; }
-dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RST"; }
-ok()   { printf '  %s\xe2\x9c\x93%s %s\n' "$C_GRN" "$C_RST" "$*"; }
-warn() { printf '  %s!%s %s\n' "$C_YEL" "$C_RST" "$*"; }
-bad()  { printf '  %s\xe2\x9c\x97%s %s\n' "$C_RED" "$C_RST" "$*"; }
-die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
-
-SSH_MUX=(-o ControlMaster=auto -o ControlPath="$HOME/.ssh/deckkit-cm-%r@%h:%p" -o ControlPersist=15s)
-SSH_OPTS=(-o ConnectTimeout="$SSH_TIMEOUT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new "${SSH_MUX[@]}")
-rsh() { ssh "${SSH_OPTS[@]}" "$DECK_SSH" "$@"; }
-deck_up() { rsh true >/dev/null 2>&1; }
-require_deck() { deck_up || die "Deck（${DECK_HOST}）连不上"; }
-
-# 在 Deck 上跑 gamectl
-gctl() {
-  local args="" a
-  for a in "$@"; do args="$args $(printf '%q' "$a")"; done
-  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "bash \"\${HOME}/deckkit/services/games/gamectl.sh\"$args"
-}
+# 在 Deck 上跑 gamectl（参数由公共库统一 %q 引用）
+gctl() { deckkit_remote_script "${DECK_GAMES_ABS}/gamectl.sh" "$@"; }
 
 # 目录/文件名 → slug（Deck 上的目录名，也是 appid 的输入之一）。
 # 原来的 `[^a-z0-9] → -` 会把日文名削成 "ver1-01" 这种没意义的东西；
 # 这里保留 \w（含中日文）—— ext4 + UTF-8 下日文目录名没有任何问题。
-slugify() {
-  python3 -c '
-import re, sys
-s = re.sub(r"\.exe$", "", sys.argv[1], flags=re.I).lower()
-print(re.sub(r"[^\w]+", "-", s, flags=re.U).strip("-_")[:40])
-' "$1"
-}
+# Deck 上的目录名：走公共库（它保留 \w，中日文名字不会被削成空串），
+# 长度按这个服务的历史值给 40 —— 老游戏的目录已经建好了，长度一变会出现
+# 「同一个游戏两个目录」。
+slugify() { deckkit_slug "$1" 40; }
 
 # Steam 给非 Steam 快捷方式算的 appid：crc32("exe" + 名字) | 0x80000000
 # 一定要和将来写进 shortcuts.vdf 的 Exe 完全一致，否则 prefix 对不上。
@@ -239,6 +219,11 @@ export LANG="\${LANG:-C.UTF-8}"
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="\$HOME/.steam/steam"
 export STEAM_COMPAT_DATA_PATH="\$HOME/.steam/steam/steamapps/compatdata/$appid"
 cd "$gamedir" || exit 1
+# deckkit 中文字体（幂等、可后台跑、失败不影响游戏）：Proton 那侧的 MS Gothic 是
+# 日文 Ume-Gothic（简体字全缺），这里保证它和一个中文 TTC 对齐；第一次启动还没建
+# prefix 时它会等 Fonts 目录出现再补。详见 deck/winfonts.sh。
+[ -x "\$HOME/deckkit/services/games/winfonts.sh" ] && \
+  bash "\$HOME/deckkit/services/games/winfonts.sh" ensure --prefix $appid --quiet >/dev/null 2>&1 &
 exec "\$HOME/.steam/steam/steamapps/common/$proton/proton" run "$gameexe" "\$@"
 EOF
   rsh "chmod 755 \"\$HOME/.local/share/deckkit/games/$slug/run.sh\""
@@ -266,6 +251,62 @@ is_uninstaller() {
 }
 installer_fingerprint() {   # 在二进制里找安装器自己的招牌字符串
   LC_ALL=C grep -qaE 'Nullsoft Install System|Nullsoft\.NSIS|Inno Setup Setup Data|InstallShield|WISE Installation|Setup Factory|InstallAnywhere' "$1" 2>/dev/null
+}
+
+# —— 老 NW.js 检测（RPG Maker MV 黑屏高发组合）——
+# 实测 MyGame8：RPG Maker MV + **老版 NW.js**（Chromium 41，2016）在 Proton 下会
+# 「有声无画」：游戏逻辑、场景、地图、渲染全部正常，canvas 里确实画出了画面
+# （探针读到非黑像素 8.84%），但那一帧送不到窗口/合成器 → 屏幕全黑，
+# 而音频与按键照常（不走渲染路径）。典型表现是**开头出一帧封面，之后就黑**。
+#
+# 判据全在**文件布局**上，`ls` 就能看出来，**装的时候零成本可查**：
+#   老版 NW.js: 有 nw.pak + ffmpegsumo.dll，**没有** nw.dll / nw_100_percent.pak
+#   新版 NW.js: 有 nw.dll + nw_100_percent.pak，没有 ffmpegsumo.dll（已并进去）
+# 实测对照：MyGame8（老，黑屏）vs Some Game 3（新，正常）判据完全相反。
+#
+# 注意分寸：这只是**风险标签，不是结论** —— 老 NW.js 不必然黑屏（deckkit 里
+# 别的老引擎游戏就没事），黑不黑是「老 NW.js × Proton × 合成路径」的组合结果。
+# 所以这里只**提示**，不拦、也不自动改参数。
+nwjs_flavor() {   # 输出形如 "RPGMakerMV 老NW.js"（都命中时），否则只报命中的部分
+  local d="$1" hits="" f
+  [ -f "$d/www/js/rpg_core.js" ] && hits="RPGMakerMV"
+  # 老版标志：有 nw.pak 且没有 nw.dll
+  if [ -f "$d/nw.pak" ] && [ ! -f "$d/nw.dll" ]; then
+    hits="${hits:+$hits }老NW.js"
+  fi
+  [ -f "$d/ffmpegsumo.dll" ] && hits="${hits:+$hits }ffmpegsumo"
+  printf '%s' "$hits"
+}
+
+# 老 NW.js 的已知解法（实测有效）。只在**这款游戏自己的 package.json** 里加，
+# 不动别的游戏（每游戏的 play 目录各自独立）。
+#   ?canvas              RPG Maker MV 自己读（rpg_core.js 的 isOptionValid）→ 走 Canvas 渲染
+#   --in-process-gpu     渲染与窗口同进程，少一次跨进程合成交接（卡住的就是这个交接）
+#   --disable-gpu-vsync  老 NW.js 常见的「只出一帧就停」对策
+#   --ignore-gpu-blacklist  别因 GPU 黑名单悄悄退回不兼容路径
+# 反例留档：--use-angle=d3d11 / --disable-frame-rate-limit **这版 Chromium 不认**
+# （binary 里搜不到，会被静默吞掉）—— 别把它们写进去当"修好了的原因"。
+NWJS_CANVAS_ARGS="--in-process-gpu --disable-gpu-vsync --ignore-gpu-blacklist"
+
+# 装完之后提示一次（**只提示，不拦、不改参数**）。
+# $1 = Deck 上的游戏目录，$2 = slug（用于把修复命令直接打出来，可空）
+nwjs_warn_if_risky() {
+  local gdir="$1" slug="${2:-}" flavor
+  # 判据全在 Deck 那边的文件布局上，所以远端跑一次 ls
+  flavor="$(rsh "d=$(printf '%q' "$gdir"); h='';
+    [ -f \"\$d/www/js/rpg_core.js\" ] && h='RPGMakerMV';
+    [ -f \"\$d/nw.pak\" ] && [ ! -f \"\$d/nw.dll\" ] && h=\"\$h 老NW.js\";
+    [ -f \"\$d/ffmpegsumo.dll\" ] && h=\"\$h ffmpegsumo\";
+    printf '%s' \"\$h\"" 2>/dev/null | sed 's/^ //')"
+  case "$flavor" in
+    *"老NW.js"*)
+      warn "检测到「${flavor// /、}」—— RPG Maker MV + 老 NW.js 在 Proton 下有黑屏先例"
+      dim "  症状：**有声无画**（音乐/按键正常、画面全黑），常见「开头出一帧封面之后就黑」。"
+      dim "  原因：游戏逻辑与 canvas 渲染都正常，但那一帧送不到窗口/合成器。"
+      dim "  不必然发生（老 NW.js 也可能没事）—— 先跑一次看看，中招了再处理："
+      dim "    deck games fix ${slug:-<slug>} --nwjs-canvas    # 只给这款游戏加参数，不动别的"
+      ;;
+  esac
 }
 
 cmd_install() {
@@ -531,6 +572,15 @@ cmd_add_dir() {
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$dir" -cf - \
     --exclude='.DS_Store' --exclude='._*' --exclude='.Spotlight-V100' . \
     | rsh "tar -xf - -C \"\$HOME/.local/share/deckkit/games/$slug/game\"" || die "拷贝失败"
+  # macOS 的文件名是 NFD（`ゾ` = U+30BD + U+3099），而游戏数据里写的是 NFC（U+30BE）
+  # —— 从 macOS 桌面直接拷过来的游戏会出现「数据 NFC / 磁盘 NFD」，引擎按数据拼路径
+  # 就 404（实测 MZ：标题 BGM 找不到，卡在 "Failed to load"）。解包后统一规范化。
+  local nfd
+  nfd="$(rsh "python3 \"\${HOME}/deckkit/services/games/nfc-names.py\" \"\$HOME/.local/share/deckkit/games/$slug/game\" --quiet" 2>/dev/null | tr -d '\r' | tail -1)"
+  case "${nfd:-}" in
+    ''|0) : ;;
+    *) ok "规范化 $nfd 个文件名（NFD→NFC —— macOS 存的名字游戏认不出来）" ;;
+  esac
   ok "已拷贝（Deck 上 $(gctl size "$gdir")）"
 
   hdr "准备 Proton 环境"
@@ -557,6 +607,7 @@ cmd_add_dir() {
     fi
   fi
   local gamedir; gamedir="$(dirname "$gameexe")"
+  nwjs_warn_if_risky "$gamedir" "$slug"
   write_launcher "$slug" "$appid" "$proton" "$gamedir" "$gameexe" "$name" || die "写启动脚本失败"
 
   ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" <<EOF
@@ -575,6 +626,7 @@ prefix_size=$(gctl size "$pfx")
 installed_at=$(date '+%Y-%m-%d %H:%M:%S')
 EOF
   ok "记录已写入"
+  winfonts_prefix_hook "$appid"
   dim "  启动方式：${launcher}（不走 Steam 也能起）"
   if [ "$noshortcut" = 1 ]; then
     dim "  按 --no-shortcut 跳过 Steam 登记；要登记随时跑：deck games shortcut ${slug}"
@@ -639,6 +691,7 @@ cmd_finish() {
   [ -n "$gameexe" ] || { bad "没找到游戏主程序"; return 1; }
   ok "游戏主程序 $gameexe"
   local gamedir; gamedir="$(dirname "$gameexe")"
+  nwjs_warn_if_risky "$gamedir" "$slug"
   local launcher; launcher="$(launcher_path "$slug")"
   write_launcher "$slug" "$appid" "$proton" "$gamedir" "$gameexe" "$name" || die "写启动脚本失败"
   ssh "${SSH_OPTS[@]}" "$DECK_SSH" "cat > \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" <<EOF
@@ -656,6 +709,7 @@ mod_files=$nmod
 prefix_size=$(gctl size "$pfx")
 EOF
   ok "记录已写入"
+  winfonts_prefix_hook "$appid"
   dim "  启动方式：${launcher}（不走 Steam 也能起）"
   dim "  想在 Steam 里也有一条游戏入口：deck games shortcut $slug"
   drop_staging "$slug"
@@ -742,12 +796,18 @@ resolve_slug() {
 }
 
 cmd_uninstall() {
-  local slug="${1:-}" yes=0 with_shortcut=0
-  shift || true
+  # **参数顺序无关**（slug 放哪都行）：
+  # 以前这里写死 `slug="${1:-}"` + 后面当选项扫 —— 而 TUI 那边是按
+  # `cmd_uninstall --yes --with-shortcut <slug>` 调的（suspend_run 吃掉了第一个参数），
+  # 于是 slug 变成了字面量 "--yes" → 报「没有叫「--yes」的记录」。
+  # 用户看到的现象就是「游戏终端管理里卸载不了游戏」。
+  local slug="" yes=0 with_shortcut=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --yes|-y) yes=1 ;;
       --with-shortcut) with_shortcut=1 ;;
+      -*) die "uninstall: 不认识的选项 $1" ;;
+      *) slug="$1" ;;              # 非选项 = slug
     esac
     shift
   done
@@ -801,10 +861,53 @@ cmd_list() {
   hdr "已安装（deckkit 管）"
   local out
   # 体积：免安装游戏是**游戏目录**的大小（prefix 几乎是空的），装 exe 的是 prefix 大小
-  out="$(rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do [ -f "$d/meta.tsv" ] || continue; n=$(sed -n "s/^name=//p" "$d/meta.tsv"); a=$(sed -n "s/^appid=//p" "$d/meta.tsv"); s=$(sed -n "s/^size=//p" "$d/meta.tsv"); [ -n "$s" ] || s=$(sed -n "s/^prefix_size=//p" "$d/meta.tsv"); t=$(sed -n "s/^installed_at=//p" "$d/meta.tsv"); printf "%s\t%s\t%s\t%s\n" "$n" "$a" "$s" "$t"; done' | grep -v '已卸载')"
+  # 日期放在第一列 → 远端 `sort` 出来就是**安装时间正序**（日期格式固定，
+  # 字典序 == 时间序），和 TUI 列表用同一个顺序。
+  out="$(rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do
+                [ -f "$d/meta.tsv" ] || continue
+                n=$(sed -n "s/^name=//p" "$d/meta.tsv")
+                a=$(sed -n "s/^appid=//p" "$d/meta.tsv")
+                s=$(sed -n "s/^size=//p" "$d/meta.tsv"); [ -n "$s" ] || s=$(sed -n "s/^prefix_size=//p" "$d/meta.tsv")
+                t=$(sed -n "s/^installed_at=//p" "$d/meta.tsv")
+                printf "%s\t%s\t%s\t%s\n" "$t" "$n" "$a" "$s"
+              done | sort' | grep -v '已卸载')"
   if [ -z "$out" ]; then warn "还没有（deck games add <setup.exe|游戏目录>）"; return 0; fi
+  # 名字列必须按**显示列**补齐：printf 的 %-24s 数的是**字符数**，
+  # 而中日文一个字占 2 列 —— 一个长中文名就能把后面三列全顶歪（实测就是这样）。
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "$out" | python3 -c '
+import sys, unicodedata
+def w(s):
+    t = 0
+    for c in s:
+        if unicodedata.combining(c):
+            continue
+        t += 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+    return t
+def fit(s, n):
+    if w(s) <= n:
+        return s + " " * (n - w(s))
+    cut, acc = "", 0
+    for c in s:
+        cw = w(c)
+        if acc + cw > n - 1:
+            break
+        cut += c; acc += cw
+    return cut + "…" + " " * max(0, n - acc - 1)
+print("  %s %s %s %s" % (fit("名字", 44), fit("appid", 11), fit("体积", 8), "安装时间"))
+for line in sys.stdin.read().split("\n"):
+    if not line.strip():
+        continue
+    f = line.split("\t")
+    if len(f) < 4:
+        continue
+    print("  %s %s %s %s" % (fit(f[1], 44), fit(f[2], 11), fit(f[3], 8), f[0]))
+'
+    return 0
+  fi
+  # 没有 python3 时的兜底（对不齐，但至少有内容）
   printf '  %-24s %-12s %-10s %s\n' "名字" "appid" "体积" "安装时间"
-  printf '%s\n' "$out" | while IFS=$'\t' read -r n a s t; do printf '  %-24s %-12s %-10s %s\n' "$n" "$a" "$s" "$t"; done
+  printf '%s\n' "$out" | while IFS=$'\t' read -r t n a s; do printf '  %-24s %-12s %-10s %s\n' "$n" "$a" "$s" "$t"; done
 }
 
 cmd_status() {
@@ -824,14 +927,31 @@ cmd_status() {
 cmd_protons() { require_deck; hdr "Deck 上的 Proton"; gctl protons | sed 's/^/  /'; }
 cmd_install_here() {
   require_deck
-  rsh "mkdir -p \"\${HOME}/deckkit/services/games/store\" \"\${HOME}/.local/share/deckkit/games\"" || die "建目录失败"
+  rsh "mkdir -p \"\${HOME}/deckkit/services/games/store\" \"\${HOME}/.local/share/deckkit/games\" \"\${HOME}/deckkit/bin\"" || die "建目录失败"
   rsync -a "$DECK_DIR/gamectl.sh" "$DECK_SSH:$DECK_GAMES_ROOT/gamectl.sh" || die "上传 gamectl.sh 失败"
   rsync -a "$DECK_DIR/shortcut-vdf.py" "$DECK_SSH:$DECK_GAMES_ROOT/shortcut-vdf.py" || die "上传 shortcut-vdf.py 失败"
   rsync -a "$DECK_DIR/compat-tool.py" "$DECK_SSH:$DECK_GAMES_ROOT/compat-tool.py" || die "上传 compat-tool.py 失败"
   rsync -a "$DECK_DIR/peicon.py" "$DECK_SSH:$DECK_GAMES_ROOT/peicon.py" || die "上传 peicon.py 失败"
-  rsync -a "$DECK_DIR/padcfg.py" "$DECK_SSH:$DECK_GAMES_ROOT/padcfg.py" || die "上传 padcfg.py 失败"
-  rsh "chmod 755 \"\${HOME}/deckkit/services/games/gamectl.sh\" \"\${HOME}/deckkit/services/games/shortcut-vdf.py\" \"\${HOME}/deckkit/services/games/compat-tool.py\" \"\${HOME}/deckkit/services/games/peicon.py\""
-  ok "Deck 侧就位（gamectl.sh + shortcut-vdf.py + compat-tool.py + peicon.py）"
+  rsync -a "$DECK_DIR/winfonts.sh" "$DECK_SSH:$DECK_GAMES_ROOT/winfonts.sh" || die "上传 winfonts.sh 失败"
+  rsync -a "$DECK_DIR/nfc-names.py" "$DECK_SSH:$DECK_GAMES_ROOT/nfc-names.py" || die "上传 nfc-names.py 失败"
+  rsh "chmod 755 \"\${HOME}/deckkit/services/games/gamectl.sh\" \"\${HOME}/deckkit/services/games/shortcut-vdf.py\" \"\${HOME}/deckkit/services/games/compat-tool.py\" \"\${HOME}/deckkit/services/games/peicon.py\" \"\${HOME}/deckkit/services/games/winfonts.sh\" \"\${HOME}/deckkit/services/games/nfc-names.py\""
+  ok "Deck 侧就位（gamectl.sh + shortcut-vdf.py + compat-tool.py + peicon.py + winfonts.sh + nfc-names.py）"
+  # 公共库 + 统一日志工具也一起推上来：gamectl.sh 用库里的通用件（Proton 枚举、
+  # 快照、桌面会话凭证），安装日志也要写到统一位置 —— 否则 Mac 上
+  # `deck logs games-install` 取不到东西。库缺失时 gamectl 会走自带兜底，不是硬依赖。
+  local lib="$SVC_DIR/../../bin/deck-lib"
+  local logtool="$SVC_DIR/../../bin/deck-log"
+  if [ -f "$lib" ]; then
+    # 传**绝对路径**：rsync/scp 走 SFTP 时远端 ~ 不保证展开（约定 §9）
+    rsync -a "$lib" "$DECK_SSH:$DECK_HOME/deckkit/bin/deck-lib" || die "上传 deck-lib 失败"
+    rsh "chmod 644 \"\$HOME/deckkit/bin/deck-lib\"" || true
+    ok "公共库已就位（~/deckkit/bin/deck-lib）"
+  fi
+  if [ -f "$logtool" ]; then
+    rsync -a "$logtool" "$DECK_SSH:$DECK_HOME/deckkit/bin/deck-log" || die "上传 deck-log 失败"
+    rsh "chmod 755 \"\${HOME}/deckkit/bin/deck-log\"" || true
+    ok "统一日志工具已就位（~/deckkit/bin/deck-log）"
+  fi
   ok "Proton：$(gctl protons | tr '\n' ' ')"
   dim "  下一步：deck games add '<setup.exe|游戏目录>'"
 }
@@ -869,6 +989,142 @@ cmd_rm() {
   cmd_uninstall "$slug" --yes --with-shortcut
 }
 
+# ─── 中文字体修复（deck games fonts）───
+# 分两层，**真正管用的是第一层**：
+#
+#  1) Wine / Proton 层（deck/winfonts.sh，见那里的大段注释）
+#     汉化游戏把 Windows 字体名写死在数据里（SRPG Studio 系写死 "MS Gothic"、
+#     引擎默认 "Meiryo UI"），而 Proton 自带的 msgothic.ttc 其实是 Ume-Gothic
+#     ——只有 JIS 字形，简体字「头开结戏环继续」一个都没有 → 空白/豆腐块。
+#     做法：用一份改名过的中文 TTC 换掉 Proton 的 msgothic.ttc（这是唯一活得过
+#     Proton 启动时字体符号链接重建的位置），再往每个 prefix 的 windows\Fonts
+#     里补 meiryo.ttc / msyh.ttc 两个链接（补 Meiryo / Meiryo UI / YaHei UI）。
+#     TTC 由 mac/mkfont.py 从 Proton 的 msyh.ttf（Source Han Sans SC）改名生成。
+#
+#  2) fontconfig 别名（deck/fonts.conf）
+#     实测对 Proton 游戏**没用**（Wine 优先命中 prefix 里按文件名注册的字体，
+#     不走 fontconfig 匹配；deck 上 fc-match 明明已指向 Noto CJK，游戏里照旧缺字）。
+#     留着是因为它对**Linux 原生**程序有效，成本又接近零。
+SC_TTC_CACHE="$HOME/.cache/deckkit/deckkit-sc.ttc"
+SC_SRC_CACHE="$HOME/.cache/deckkit/cjk-source.ttf"
+
+# 在 Deck 上跑 winfonts.sh
+winfonts_ctl() {
+  local args="" a
+  for a in "$@"; do args="$args $(printf '%q' "$a")"; done
+  ssh "${SSH_OPTS[@]}" "$DECK_SSH" "bash \"\${HOME}/deckkit/services/games/winfonts.sh\"$args"
+}
+
+# 上传 Deck 侧脚本（幂等；每次 fonts/装游戏都会走）
+winfonts_deploy() {
+  rsh "mkdir -p \"\${HOME}/deckkit/services/games\"" 2>/dev/null || true
+  rsync -a "$DECK_DIR/winfonts.sh" "$DECK_SSH:$DECK_GAMES_ROOT/winfonts.sh" >/dev/null 2>&1 \
+    || { warn "上传 winfonts.sh 失败"; return 1; }
+  rsh "chmod 755 \"\${HOME}/deckkit/services/games/winfonts.sh\"" 2>/dev/null
+}
+
+# 生成/复用一个中文 TTC（源字体取 Deck 上 Proton 自带的 msyh.ttf =
+# Source Han Sans SC，glyf 轮廓、44,812 码位，不用下载任何东西）
+ensure_sc_ttc() {
+  local force="${1:-}"
+  [ "$force" = "--rebuild" ] && rm -f "$SC_TTC_CACHE"
+  [ -f "$SC_TTC_CACHE" ] && return 0
+  mkdir -p "$(dirname "$SC_TTC_CACHE")"
+  python3 -c "import fontTools" 2>/dev/null \
+    || die "本机缺 fontTools（pip3 install fonttools）—— 生成中文 TTC 要用它"
+  if [ ! -f "$SC_SRC_CACHE" ]; then
+    local src
+    src="$(rsh "ls \"\$HOME/.steam/steam/steamapps/common/\"Proton*/files/share/fonts/msyh.ttf 2>/dev/null | head -1" | tr -d '\r')"
+    [ -n "$src" ] || die "Deck 上找不到 Proton 的 msyh.ttf（哪台 Proton 都没装？）"
+    hdr "取源字体（Deck 上 Proton 自带的中文 TTF）"
+    rsh "cat \"$src\"" >"$SC_SRC_CACHE" || die "取源字体失败"
+    dim "  $(du -h "$SC_SRC_CACHE" | cut -f1)  →  $SC_SRC_CACHE"
+  fi
+  hdr "生成中文 TTC（MS Gothic / Meiryo UI / YaHei UI … → Source Han Sans SC）"
+  python3 "$MAC_DIR/mkfont.py" "$SC_SRC_CACHE" "$SC_TTC_CACHE" || die "生成 TTC 失败"
+}
+
+# 装游戏收尾时顺手给这个 prefix 补一下（没跑过 deck games fonts 就安静跳过）
+winfonts_prefix_hook() {
+  local appid="${1:-}"
+  [ -n "$appid" ] || return 0
+  rsh "test -f \"\${HOME}/deckkit/services/games/winfonts.sh\" && \
+       test -f \"\${HOME}/.local/share/deckkit/fonts/deckkit-sc.ttc\"" 2>/dev/null || {
+    dim "  中文字体：还没装（deck games fonts）—— 汉化游戏可能缺字/豆腐块"
+    return 0
+  }
+  if winfonts_ctl install --prefix "$appid" >/dev/null 2>&1; then
+    dim "  中文字体：已给这个 prefix 补上 MS Gothic / Meiryo UI 的中文字形"
+  fi
+  return 0
+}
+
+cmd_fonts() {
+  local action="${1:-install}"
+  require_deck
+  case "$action" in
+    status|check)
+      winfonts_deploy
+      hdr "中文字体（Wine / Proton 层 —— 管用的那层）"
+      winfonts_ctl status | sed 's/^/  /'
+      hdr "fontconfig 别名（只对 Linux 原生程序有用）"
+      local f="$DECK_HOME/.config/fontconfig/fonts.conf"
+      if rsh "test -f \"$f\"" 2>/dev/null; then
+        ok "已安装：$f"
+        rsh 'for n in "Meiryo UI" "MS Gothic" "SimSun"; do
+               printf "    %-12s → %s\n" "$n" "$(fc-match "$n" 2>/dev/null)"
+             done' 2>/dev/null | sed 's/^/  /'
+      else
+        warn "没装（不影响 Proton 游戏，只影响 Linux 原生程序）"
+      fi
+      ;;
+
+    install)
+      local rebuild="${2:-}"
+      winfonts_deploy || die "Deck 侧脚本没就位"
+      ensure_sc_ttc "$rebuild"
+      hdr "推到 Deck"
+      rsh "mkdir -p \"\${HOME}/.local/share/deckkit/fonts\"" || die "建目录失败"
+      rsync -a "$SC_TTC_CACHE" "$DECK_SSH:$DECK_HOME/.local/share/deckkit/fonts/deckkit-sc.ttc" \
+        || die "上传 TTC 失败"
+      dim "  ~/.local/share/deckkit/fonts/deckkit-sc.ttc"
+      hdr "给 Proton 和各个 prefix 装上"
+      winfonts_ctl install | sed 's/^/  /'
+
+      local src="$DECK_DIR/fonts.conf"
+      if [ -f "$src" ]; then
+        hdr "顺带装 fontconfig 别名（Linux 原生程序用）"
+        rsh "mkdir -p \"\${HOME}/.config/fontconfig\"" || true
+        rsh "f=\"\${HOME}/.config/fontconfig/fonts.conf\"
+             [ -f \"\$f\" ] && cp -a \"\$f\" \"\$f.deckkit-bak\" || true" 2>/dev/null
+        rsync -a "$src" "$DECK_SSH:$DECK_HOME/.config/fontconfig/fonts.conf" \
+          && rsh "fc-cache -f >/dev/null 2>&1" && ok "已装并刷新缓存" \
+          || warn "fontconfig 别名没装上（不影响 Proton 游戏）"
+      fi
+      say ""
+      dim "  这只动 Proton 的字体文件和 prefix 的 windows\\Fonts，**不碰任何游戏文件**。"
+      dim "  卸载游戏不影响；Proton 更新后跑一次 deck games fonts install 即可复位。"
+      ;;
+
+    rebuild)
+      cmd_fonts install --rebuild
+      ;;
+
+    remove|uninstall)
+      winfonts_deploy
+      hdr "还原 Wine / Proton 层"
+      winfonts_ctl remove | sed 's/^/  /'
+      hdr "还原 fontconfig 别名"
+      rsh "f=\"\${HOME}/.config/fontconfig/fonts.conf\"
+           if [ -f \"\$f.deckkit-bak\" ]; then mv -f \"\$f.deckkit-bak\" \"\$f\"; echo '  已还原备份';
+           else rm -f \"\$f\"; echo '  已删除'; fi" 2>/dev/null
+      rsh "fc-cache -f >/dev/null 2>&1" 2>/dev/null || true
+      ;;
+
+    *) die "fonts: 用法 deck games fonts [status|install|rebuild|remove]" ;;
+  esac
+}
+
 # 清掉残留的"已卸载"记录（老版本会留）
 cmd_clean() {
   require_deck
@@ -878,126 +1134,24 @@ cmd_clean() {
   ok "清掉 ${n} 条残留记录"
 }
 
-# ───────────────── Steam Input 手柄布局（deck games pad）─────────────────
-# 非 Steam 游戏大多没有手柄支持，界面只能靠触控板 —— Steam Input 就是"把手柄当
-# 鼠标/键盘"的那一层，而且**不用碰游戏本体**。每个快捷方式的布局存在：
-#   .../steamapps/common/Steam Controller Configs/<steamid>/config/<key>/controller_neptune.vdf
-# key = 快捷方式名字小写去点（实测对出来过：`MyGame2 V2.0版+…` → `…v20版+…`），
-# 并在同目录 configset_controller_neptune.vdf 里用 `"<key>" { "autosave" "1" }` 登记。
-# 映射本体直接取 Steam 自带的 Deck 模板（controller_base/templates/controller_neptune_*.vdf）。
-# 注意：Steam 运行时会把这些配置缓存在内存里、退出时回写，所以**真写必须让 Steam 停着**
-# （和写 shortcuts.vdf 一个道理，用 ensure_session）；--list / --dry-run 可以边跑边看。
-cmd_pad() {
-  local want="" tpl="mouse" key="" appid_target="" value="150"
-  local action="install" dry=0
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -t|--template) shift; tpl="${1:-mouse}" ;;
-      --key) shift; key="${1:-}" ;;
-      --appid) shift; appid_target="${1:-}" ;;      # 直接指定 appid（Steam 正版游戏也能改）
-      -s|--sensitivity) shift; value="${1:-150}"; action="sens" ;;
-      -l|--list) action="list" ;;
-      --rm|--remove) action="remove" ;;
-      -n|--dry-run) dry=1 ;;
-      -*) die "pad: 不认识的选项 $1（见 deck games help-all）" ;;
-      *) want="$1" ;;
-    esac
-    shift
-  done
-  require_deck
-
-  local base cid cfgdir pc
-  base="$DECK_HOME/.local/share/Steam/steamapps/common/Steam Controller Configs"
-  cid="$(rsh "ls -1 \"$base\" 2>/dev/null | head -1")"
-  [ -n "$cid" ] || die "Deck 上没找到 Steam Controller Configs（Steam 至少启动过一次才会建它）"
-  cfgdir="$base/$cid/config"
-  pc="$DECK_GAMES_ABS/padcfg.py"
-  rsh "test -f \"$pc\"" || die "Deck 上还没有 padcfg.py —— 先跑 deck games install-here"
-
-  # 目标清单 → games 文件（appid<TAB>名字）；中文名不往 ssh 命令行里塞
-  mkdir -p "$COVER_TMP"
-  local tmp="$COVER_TMP/pad-games.tsv" slug nm ap n=0
-  : > "$tmp"
-  if [ -n "$appid_target" ]; then
-    key="${key:-$appid_target}"                        # Steam 正版游戏：目录名/key 就是 appid
-    nm="$(rsh "sed -n 's/^[[:space:]]*\"name\"[[:space:]]*\"\(.*\)\"/\1/p' \"$DECK_HOME/.steam/steam/steamapps/appmanifest_${appid_target}.acf\" 2>/dev/null | head -1")"
-    [ -n "$nm" ] || nm="appid ${appid_target}"
-    printf '%s\t%s\n' "$appid_target" "$nm" >> "$tmp"
-  else
-    local slugs="" r
-    if [ -z "$want" ] || [ "$want" = all ]; then
-      [ "$action" = install ] && action="list"
-      slugs="$(games_table | cut -f1)"
-    else
-      r="$(resolve_slug "$want")"
-      [ -n "$r" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
-      slugs="$r"
-    fi
-    [ -n "$slugs" ] || { warn "还没有装过游戏"; return 0; }
-    for slug in $slugs; do
-      nm="$(mget "$slug" name)"; ap="$(mget "$slug" appid)"
-      [ -n "$ap" ] || continue
-      printf '%s\t%s\n' "$ap" "$nm" >> "$tmp"
-    done
-  fi
-  scp -q "${SSH_OPTS[@]}" "$tmp" "$DECK_SSH:/tmp/deckkit-pad-games.tsv" || die "传清单失败"
-
-  # 参数一律显式判断（`${x:+--flag}` 对 0/1 开关是错的：0 也是"非空"）
-  local extra="" appid_arg=""
-  [ "$dry" = 1 ] && extra="$extra --dry-run"
-  [ -z "$appid_target" ] || appid_arg="--appid $appid_target"
-  [ -z "$key" ] || extra="$extra --key $key"
-
-  if [ "$action" = list ]; then
-    hdr "手柄布局现状"
-    rsh "python3 \"$pc\" list --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv"
-    dim "  可装模板：mouse（仅鼠标）/ gamepad+mouse / wasd / webbrowser / fps / joystick / touchscreen"
-    return 0
-  fi
-
-  # 真写：Steam 必须停着（它会把这些配置缓存在内存里、退出时回写）
-  [ "$dry" = 1 ] || ensure_session
-
-  if [ "$action" = sens ]; then
-    hdr "右摇杆鼠标灵敏度 → ${value}"
-  else
-    hdr "手柄布局：$([ "$action" = remove ] && echo 撤掉 || echo "装 $tpl")"
-  fi
-
-  local line
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    ap="${line%%	*}"
-    say ""
-    if [ "$action" = sens ]; then
-      rsh "python3 \"$pc\" sens --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv \
-             --appid \"$ap\" $appid_arg --value \"$value\" $extra"
-    else
-      rsh "python3 \"$pc\" $action --cfgdir \"$cfgdir\" --games-file /tmp/deckkit-pad-games.tsv \
-             --appid \"$ap\" $appid_arg --template \"$tpl\" $extra"
-    fi
-    n=$((n + 1))
-  done < "$tmp"
-
-  case "$action" in
-    remove) ok "撤掉 $n 个游戏的布局（Steam 里回到默认）" ;;
-    sens)   ok "$n 个游戏的右摇杆鼠标灵敏度改成 ${value}"
-            dim "  重启 Steam（或切一次模式）后生效；觉得太快/太慢就换个数再来一次" ;;
-    *)      ok "$n 个游戏写好了（模板 ${tpl}）"
-            dim "  重启 Steam（或切一次 Gaming/桌面模式）后：游戏页面 → 手柄图标 → 看一下布局名" ;;
-  esac
-}
-
 # ─────────────────────── 交互式游戏管理（TUI）───────────────────────
 # 像 htop/vim 那样：**备用屏**里画定长画面，退出后终端恢复原样（不会把一帧帧
-# 列表堆进 scrollback，也不会因为行数超过终端高度而往下滚）。方向键选、回车卸载。
+# 列表堆进 scrollback，也不会因为行数超过终端高度而往下滚）。全方向键操作。
 # 几条硬规矩（都踩过）：
 #   ① draw 里**不许有 I/O**：一开始每次重画都跑 `deck brief`（4 次 ssh 约 10 秒），
 #      期间 echo 开着 → 按键被回显成 ^[[A 又排进队列 → 每字节再触发一次重画 = "疯狂刷新"。
+#      （现在列表页干脆不画服务状态，`deck brief` 也就不再调了。）
 #   ② 全程 `stty -echo`（问 y/N 与退出命令输出时临时打开）。
-#   ③ 方向键同时认 `ESC[A` 与 `ESC OA`（DECCKM）。
-#   ④ 画面必须**装得下**：列表超长就开窗口分页（多余项用 ↑/↓ 提示），否则会滚屏。
-#   ⑤ 跑外部命令（卸载/封面/维修）时先退出备用屏，命令输出留在正常屏幕里可回看。
+#   ③ 方向键同时认 `ESC[A` 与 `ESC OA`（DECCKM）。**读后续字节的超时只能写整数秒**：
+#      bash 3.2 既不认 `-t 0.2`（这条 read 直接失败 → 方向键全失灵），
+#      `-t 0` 也不是"非阻塞读"而是立即失败（会把 `ESC[C` 拆成孤立的 ESC，
+#      于是每按一次方向键都被当成 Esc）。
+#   ④ 画面必须**装得下**：列表超长就分页（←/→ 翻页），否则会滚屏。
+#   ⑤ 每帧开头必须 `\033[H\033[J`（**先回左上、再清屏**）：写成 `\033[J\033[H` 时
+#      `\033[J` 是从旧光标位置清到屏尾，清不掉上一帧多出来的行 ——
+#      画面一变矮（收起展开行、列表变短）屏上就留下几行残影。
+#   ⑥ 对齐按**显示列**算，不能按字符数（中日文一个字占 2 列）—— 见 fit_cols。
+#   ⑦ 跑外部命令（卸载/封面/维修）时先退出备用屏，命令输出留在正常屏幕里可回看。
 # 还原用的状态必须是**全局**的：EXIT trap 触发时 cmd_tui 的 local 已经出了作用域，
 # 用 local 会 `set -u` 报 "echo_off: unbound variable" 并且**不会执行 stty echo** ——
 # 用户终端就被留在"无回显"状态（实测踩到，只能 reset 恢复）。
@@ -1015,7 +1169,15 @@ tui_restore_global() {
 cmd_tui() {
   if [ ! -t 0 ] || [ ! -t 1 ]; then cmd_list; return 0; fi
   local ROOT; ROOT="$(cd "$SVC_DIR/../.." && pwd)"     # 框架根：$SVC_DIR 是 <root>/services/games
-  local slugs=() names=() sizes=() sel=0 key rest ans brief=
+  local slugs=() names=() sizes=() dates=() sel=0 key rest ans
+  local expanded=-1 cmd_idx=0 list_h=1
+  # raw_rows = 采集到的原始数据（未排序）。排序放在本地做，所以按 s 换排序方式时
+  # 不用再问一次 Deck —— 采集和排序彻底分开。
+  local raw_rows="" sort_key=date
+  local CMD_LABELS; CMD_LABELS=(卸载 封面 维修)
+  # 显示宽度要靠 python 算（bash 数的是字符数，中日文一个占两列）
+  local HAVE_PY=0
+  command -v python3 >/dev/null 2>&1 && HAVE_PY=1
   local ALT_ON ALT_OFF CIVIS CNORM
   ALT_ON="$(tput smcup 2>/dev/null)";  [ -n "$ALT_ON" ]  || ALT_ON=$'\033[?1049h'
   ALT_OFF="$(tput rmcup 2>/dev/null)"; [ -n "$ALT_OFF" ] || ALT_OFF=$'\033[?1049l'
@@ -1028,20 +1190,89 @@ cmd_tui() {
   tui_leave() { tui_echo_on; printf '%s%s\033[0m' "$CNORM" "$ALT_OFF"; }
   tui_restore() { tui_leave; }
 
-  load_list() {   # 唯一做 I/O 的地方：列表 + 精简状态（进入 / 操作后 / 按 r）
-    slugs=(); names=(); sizes=()
-    local slug name size
-    while IFS=$'\t' read -r slug name size; do
-      [ -n "$slug" ] || continue
-      slugs+=("$slug"); names+=("$name"); sizes+=("$size")
-    done < <(rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do
+  # 采集：一次 ssh 拿全量原始数据，**不排序** —— 排序交给下面的 apply_sort，
+  # 于是「换排序方式」是纯本地操作，不用再联网。
+  # 每行是 `安装日期 \t slug \t 名字 \t 体积`。
+  # 这里**不再调 `deck brief`**：那要再跑一遍 4 个服务的 status（约 4 秒），
+  # 而画面本来就不显示那段状态了（理由见 draw 上面的说明）。
+  load_list() {
+    raw_rows="$(rsh 'for d in "$HOME"/deckkit/services/games/store/*/; do
                     [ -f "$d/meta.tsv" ] || continue
                     n=$(sed -n "s/^name=//p" "$d/meta.tsv" | head -1)
                     s=$(sed -n "s/^size=//p" "$d/meta.tsv" | head -1)
                     [ -n "$s" ] || s=$(sed -n "s/^prefix_size=//p" "$d/meta.tsv" | head -1)
-                    printf "%s\t%s\t%s\n" "$(basename "$d")" "$n" "$s"
-                  done' 2>/dev/null)
-    brief="$("$ROOT/bin/deck" brief 2>/dev/null)"
+                    t=$(sed -n "s/^installed_at=//p" "$d/meta.tsv" | head -1)
+                    [ -n "$t" ] || t=$(stat -c %y "$d" 2>/dev/null | cut -d. -f1)
+                    printf "%s\t%s\t%s\t%s\n" "$t" "$(basename "$d")" "$n" "$s"
+                  done' 2>/dev/null)"
+    apply_sort
+    expanded=-1
+    return 0
+  }
+
+  # 排序交给 python：三个键里「体积」是 `380M` / `3.1G` 这种**带单位字符串**，
+  # 直接 `sort` 会按文本比 —— `1.2G` 排在 `380M` 前面（因为 '1' < '3'），完全是错的。
+  # 名字同理：大小写和全角要按显示习惯来。
+  sort_rows() {
+    local key="${1:-date}"
+    if [ "${HAVE_PY:-0}" != 1 ]; then
+      # 没 python3 的兜底：体积会按文本排（不精确），其余两个键没问题
+      case "$key" in
+        name) sort -t "$(printf '\t')" -k3,3 ;;
+        size) sort -t "$(printf '\t')" -k4,4 ;;
+        *)    sort ;;
+      esac
+      return 0
+    fi
+    python3 -c '
+import sys
+key = sys.argv[1]
+mult = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+def bytes_of(s):
+    s = (s or "").strip()
+    if not s:
+        return 0.0
+    u = 1
+    if s[-1] in mult:
+        u = mult[s[-1]]
+        s = s[:-1]
+    try:
+        return float(s) * u
+    except ValueError:
+        return 0.0
+rows = [l.split("\t") for l in sys.stdin.read().split("\n") if l.strip()]
+def sort_key_of(r):
+    if key == "name":
+        return r[2].lower()
+    if key == "size":
+        return -bytes_of(r[3])        # 体积：大的在前
+    return (r[0], r[2].lower())       # 日期：旧的在前（同一天按名字兜底，顺序才稳定）
+rows.sort(key=sort_key_of)
+sys.stdout.write("\n".join("\t".join(r) for r in rows) + "\n")
+' "$key"
+  }
+
+  # 按 sort_key 重排四个并行数组（纯本地）
+  apply_sort() {
+    local keep=""
+    if [ "${#slugs[@]}" -gt 0 ] && [ "$sel" -lt "${#slugs[@]}" ]; then keep="${slugs[$sel]}"; fi
+
+    slugs=(); names=(); sizes=(); dates=()
+    local dt slug name size
+    while IFS=$'\t' read -r dt slug name size; do
+      [ -n "$slug" ] || continue
+      dates+=("$dt"); slugs+=("$slug"); names+=("$name"); sizes+=("$size")
+    done <<< "$(printf '%s\n' "$raw_rows" | sort_rows "$sort_key")"
+
+    # 换排序后把选中项**跟住**（按 slug 找它的新位置）—— 否则一按 s
+    # 光标就落到别的游戏上，看着像"自己跳了一下"。
+    if [ -n "$keep" ]; then
+      local i=0
+      while [ "$i" -lt "${#slugs[@]}" ]; do
+        if [ "${slugs[$i]}" = "$keep" ]; then sel="$i"; break; fi
+        i=$(( i + 1 ))
+      done
+    fi
     [ "$sel" -ge "${#slugs[@]}" ] && sel=$(( ${#slugs[@]} > 0 ? ${#slugs[@]} - 1 : 0 ))
     return 0
   }
@@ -1069,26 +1300,81 @@ cmd_tui() {
     while [ "$n" -gt 0 ]; do printf ' '; n=$(( n - 1 )); done
   }
 
+  # 把一页名字按**显示列宽**截断 + 补齐 —— 这是「条目没对齐」的正解。
+  #
+  # 为什么不能直接用 tui_pad/tui_cut：它们数的是**字符数**（`${#s}`），
+  # 而中日文一个字占 **2 列** —— 于是「MyGame」按 8 个字符补空格，
+  # 实际却占了 16 列，右边的大小列整片错开（列表里中日文行和英文行对不上就是这个）。
+  #
+  # 交给 python 一次算一整页（不是一行一次调用：那样一屏要 fork 几十次）。
+  # 组合字符（日语浊音那种「か」+「゛」）宽度按 0 算，否则名字会平白多出一列。
+  fit_cols() {   # $1=列宽；其余参数=名字；逐行输出等宽结果
+    local lim="${1:-0}"; shift
+    [ $# -gt 0 ] || return 0
+    if [ "${HAVE_PY:-0}" != 1 ]; then
+      # 没有 python3 时的兜底：退回按字符处理 —— 不完美，但不会崩也不会折行
+      local s
+      for s in "$@"; do printf '%s\n' "$(tui_pad "$lim" "$(tui_cut "$lim" "$s")")"; done
+      return 0
+    fi
+    printf '%s\n' "$@" | python3 -c '
+import sys, unicodedata
+lim = int(sys.argv[1])
+def w(s):
+    t = 0
+    for c in s:
+        if unicodedata.combining(c):
+            continue
+        t += 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+    return t
+out = []
+for line in sys.stdin.read().split("\n"):
+    if line == "":
+        continue
+    if w(line) <= lim:
+        out.append(line + " " * (lim - w(line)))
+    else:
+        cut, acc = "", 0
+        for c in line:
+            cw = w(c)
+            if acc + cw > lim - 1:
+                break
+            cut += c; acc += cw
+        out.append(cut + "…" + " " * max(0, lim - acc - 1))
+sys.stdout.write("\n".join(out) + "\n")
+' "$lim"
+  }
+
+  # 版面（自上而下）：
+  #   标题 / 分隔 / 列表 / 分隔 / 提示
+  # 这里**不画服务状态**了：那是另一件事（`deck brief`），塞进游戏列表里
+  # 既占 4 行、又每次刷新都要跑一遍 4 个服务的 status，而且操作完还容易和
+  # 命令输出挤在一起显得"上面空一大段"。想知道服务状态就用 `deck`。
   draw() {        # 纯渲染：一次 printf 出整屏（不跑命令、不联网、不分多次写 → 不闪不滚）
-    local LINES COLS buf="" nbrief=0 list_h total start end i name size row
+    local LINES COLS buf="" total start end i name size row
     tui_size
     [ "$LINES" -lt 8 ] && LINES=8
-    [ "$COLS" -lt 30 ] && COLS=30
-    # 宽度按"一个字符最坏占 2 列"保守估，宁可早截断也不折行（折行就会滚屏）
-    local lim=$(( (COLS - 3) * 5 / 8 )); [ "$lim" -lt 8 ] && lim=8
-    [ -n "$brief" ] && nbrief="$(printf '%s\n' "$brief" | wc -l | tr -d ' ')"
-    list_h=$(( LINES - (nbrief + 3) - 2 - 1 ))     # 末尾留一行余量，别顶到屏幕底
-    [ "$list_h" -lt 1 ] && list_h=1
-    total="${#slugs[@]}"
-    local name_w=$(( lim - 9 )); [ "$name_w" -lt 6 ] && name_w=6
+    [ "$COLS" -lt 40 ] && COLS=40
 
-    buf="${C_B}  deckkit · 游戏管理${C_RST}"$'\033[K\n'
-    buf+="$(tui_cut "$COLS" "───────────────────────────────────────────────")"$'\033[K\n'
-    if [ -n "$brief" ]; then
-      while IFS= read -r row; do
-        buf+="  $(tui_cut "$lim" "$row")"$'\033[K\n'
-      done <<< "$brief"
-    fi
+    total="${#slugs[@]}"
+    # 行账：标题 1 + 分隔 1 + 列表 list_h + 分隔 1 + 提示 1 + 末尾留 1 = LINES。
+    # 展开的那条命令菜单要多占 1 行，所以再扣 1 —— 始终预留，
+    # 画面高度就不会随展开/收起忽高忽低（那正是会滚屏/留空行的原因）。
+    list_h=$(( LINES - 6 ))
+    [ "$list_h" -lt 1 ] && list_h=1
+
+    # 列账："  ▶ "(4) + 日期(10) + "  "(2) + 名字 + " "(1) + 大小(8) + 右侧留 1
+    # 一律按**显示列**算：名字由 fit_cols 处理成等宽（中日文占 2 列，见那里的说明）
+    local date_w=10 size_w=8
+    local name_w=$(( COLS - 4 - date_w - 2 - 1 - size_w - 1 ))
+    [ "$name_w" -lt 8 ] && name_w=8
+
+    # 先回左上 + 清空整屏，再往上画。**顺序不能反**（原来写的是 `\033[J\033[H`）：
+    # `\033[J` 是从「当前光标位置」清到屏尾，而那一刻光标还停在上一次绘制的末尾，
+    # 所以清不掉上一次比这一次**多出来的行** —— 画面一变矮（收起展开行、列表变短、
+    # 去掉状态段）屏上就留下几行残影，看着就是"上面空了一大段"。
+    buf=$'\033[H\033[J'
+    buf+="${C_B}  deckkit · 游戏管理${C_RST}"$'\033[K\n'
     buf+="$(tui_cut "$COLS" "───────────────────────────────────────────────")"$'\033[K\n'
 
     if [ "$total" = 0 ]; then
@@ -1100,32 +1386,61 @@ cmd_tui() {
         end=$(( start + list_h ))
         [ "$end" -gt "$total" ] && { end="$total"; start=$(( end - list_h )); }
         [ "$start" -lt 0 ] && start=0
-        # 有"上面还有"提示行时，列表少显示一行
-        [ "$start" -gt 0 ] && [ $(( end - start + 1 )) -gt "$list_h" ] && end=$(( end - 1 ))
       fi
-      if [ "$start" -gt 0 ]; then
-        buf+="  ${C_DIM}↑ 上面还有 $start 项${C_RST}"$'\033[K\n'
+
+      # 本页的名字一次性算成等宽（一次 python，不是每行一次）
+      local page=() fitted=()
+      i="$start"
+      while [ "$i" -lt "$end" ]; do page+=("${names[$i]}"); i=$(( i + 1 )); done
+      if [ "${#page[@]}" -gt 0 ]; then
+        while IFS= read -r row; do fitted+=("$row"); done < <(fit_cols "$name_w" "${page[@]}")
       fi
+
+      local k=0
       i="$start"
       while [ "$i" -lt "$end" ]; do
-        name="$(tui_cut "$name_w" "${names[$i]}")"; size="${sizes[$i]}"
+        name="${fitted[$k]:-}"
+        size="${sizes[$i]}"
+        row="${dates[$i]}"; row="${row:0:date_w}"     # 只显示日期，不带时分秒
         if [ "$i" = "$sel" ]; then
-          buf+=$'\033[7m'"  ▶ $(tui_pad "$name_w" "$name") ${C_RST}"$'\033[7m'"$(tui_pad 8 "$size")"$'\033[0m'$'\033[K\n'
+          buf+=$'\033[7m'"  ▶ ${row}  ${name} $(tui_pad "$size_w" "$size")"$'\033[0m'$'\033[K\n'
         else
-          buf+="    $(tui_pad "$name_w" "$name") $(tui_pad 8 "$size")"$'\033[K\n'
+          buf+="    ${row}  ${name} $(tui_pad "$size_w" "$size")"$'\033[K\n'
         fi
-        i=$(( i + 1 ))
+        # 展开行：缩进一层放命令 —— ←/→ 选，回车执行
+        if [ "$i" = "$expanded" ]; then
+          local cline="      └ "
+          local ci=0
+          while [ "$ci" -lt "${#CMD_LABELS[@]}" ]; do
+            if [ "$ci" = "$cmd_idx" ]; then
+              cline+=$'\033[7m'" ${CMD_LABELS[$ci]} "$'\033[0m'"  "
+            else
+              cline+=" ${CMD_LABELS[$ci]}    "
+            fi
+            ci=$(( ci + 1 ))
+          done
+          buf+="${cline}"$'\033[K\n'
+        fi
+        i=$(( i + 1 )); k=$(( k + 1 ))
       done
-      if [ "$end" -lt "$total" ]; then
-        buf+="  ${C_DIM}↓ 下面还有 $(( total - end )) 项${C_RST}"$'\033[K\n'
-      fi
     fi
 
     buf+="$(tui_cut "$COLS" "───────────────────────────────────────────────")"$'\033[K\n'
-    local hint="↑/↓ 选择 · 回车 卸载 · c 重做封面 · f 维修 · r 刷新 · q 退出"
-    [ "$COLS" -lt 76 ] && hint="↑/↓ 选择 · 回车 卸载 · q 退出"
-    buf+="  $(tui_cut "$lim" "$hint")"$'\033[K'
-    buf+=$'\033[J\033[H'                        # 清掉残余 + 光标回左上
+    # 提示行里要显示**当前**排序方式 —— 否则按了 s 只能从列表顺序去猜现在是什么排序
+    local sl="日期"
+    case "$sort_key" in name) sl="名称" ;; size) sl="大小" ;; esac
+    local hint
+    if [ "$expanded" -ge 0 ]; then
+      hint="←/→ 选命令 · 回车 执行 · Esc 收起 · q 退出"
+    elif [ "$COLS" -ge 78 ]; then
+      hint="↑/↓ 选择 · ←/→ 翻页 · 回车 展开 · s 排序：${sl} · r 刷新 · q 退出"
+    elif [ "$COLS" -ge 54 ]; then
+      hint="↑/↓ 选择 · ←/→ 翻页 · 回车 展开 · s 排序：${sl} · q 退出"
+    else
+      hint="↑/↓ · ←/→ · 回车 · s：${sl} · q"
+    fi
+    [ "$total" -gt 0 ] && hint="${hint}   ${C_DIM}$(( sel + 1 ))/${total}${C_RST}"
+    buf+="  $(tui_cut "$COLS" "$hint")"$'\033[K'
     printf '%s' "$buf"
   }
 
@@ -1158,23 +1473,13 @@ cmd_tui() {
   trap 'tui_restore_global' EXIT
   trap 'tui_restore_global; exit 0' INT TERM
   tui_enter
-  printf '\033[H\033[2J  %sdeckkit · 游戏管理%s\n\n  %s正在读取服务状态和游戏列表…%s\n' "$C_B" "$C_RST" "$C_DIM" "$C_RST"
+  printf '\033[H\033[2J  %sdeckkit · 游戏管理%s\n\n  %s正在读取游戏列表…%s\n' "$C_B" "$C_RST" "$C_DIM" "$C_RST"
   load_list
-  local last_sel=-1
-  while :; do
-    [ "$sel" != "$last_sel" ] && { draw; last_sel="$sel"; }
-    IFS= read -rsn1 key || break
-    if [ "$key" = $'\033' ]; then
-      IFS= read -rsn2 -t 1 rest || rest=""
-      key="$key$rest"
-    fi
-    case "$key" in
-      $'\033[A'|$'\033OA'|k)
-        sel=$(( sel > 0 ? sel - 1 : ${#slugs[@]} - 1 )) ;;
-      $'\033[B'|$'\033OB'|j)
-        sel=$(( sel < ${#slugs[@]} - 1 ? sel + 1 : 0 )) ;;
-      ''|$'\n'|$'\r')
-        [ "${#slugs[@]}" = 0 ] && continue
+  # 执行展开菜单里选中的那条命令（$1 = 命令下标）
+  run_cmd() {
+    case "$1" in
+      0)
+        # 卸载不可恢复、且会退出 Steam —— 仍然要确认一次
         [ -t 0 ] && { stty -echo 2>/dev/null; TUI_ECHO_OFF=1; }
         prompt_line "卸载「${names[$sel]}」（本体 + Steam 条目 + 封面，不可恢复；会退出 Steam）？[y/N] "
         IFS= read -rsn1 -t 30 ans || ans=""
@@ -1182,17 +1487,83 @@ cmd_tui() {
         prompt_line "卸载「${names[$sel]}」？[y/N] ${ans:-（超时，按未确认处理）}"
         if [ "$ans" = y ] || [ "$ans" = Y ]; then
           suspend_run "${slugs[$sel]}" cmd_uninstall --yes --with-shortcut "${slugs[$sel]}"
-        fi
-        last_sel=-1 ;;
-      c)
+        fi ;;
+      1) suspend_run "${slugs[$sel]}" cmd_cover "${slugs[$sel]}" ;;
+      2) suspend_run "${slugs[$sel]}" cmd_fix "${slugs[$sel]}" ;;
+    esac
+    expanded=-1
+    last_sel=-1
+  }
+  page_down() { local t="${#slugs[@]}"; [ "$t" = 0 ] && return 0; sel=$(( sel + list_h )); [ "$sel" -gt $(( t - 1 )) ] && sel=$(( t - 1 )); return 0; }
+  page_up()   { [ "${#slugs[@]}" = 0 ] && return 0; sel=$(( sel - list_h )); [ "$sel" -lt 0 ] && sel=0; return 0; }
+
+  local last_sel=-1 last_exp=-2 last_cmd=-1
+  while :; do
+    # 只在「看得见的东西」变了才重画：draw 里有 I/O 会引发疯狂刷新（踩过）
+    if [ "$sel" != "$last_sel" ] || [ "$expanded" != "$last_exp" ] || [ "$cmd_idx" != "$last_cmd" ]; then
+      draw; last_sel="$sel"; last_exp="$expanded"; last_cmd="$cmd_idx"
+    fi
+    IFS= read -rsn1 key || break
+    if [ "$key" = $'\033' ]; then
+      # 方向键的序列长度不一样：`ESC[A`(3 字节) 是普通方向键，`ESC[5~`(4 字节) 是
+      # PageUp —— 所以要一直读到结束符（字母或 ~），**不能写死读 2 个字节**：
+      # 写死的话 `ESC[5~` 会剩下一个 `~` 留在输入队列里，被当成一次独立按键。
+      # 超时必须是**整数秒**：macOS 自带的 bash 3.2 既不接受小数秒
+      # （`-t 0.2` 报 "invalid timeout specification" 且这条 read 直接失败，
+      # 方向键全部失灵），`-t 0` 也不是"非阻塞读"而是**立即失败** ——
+      # 用它会把 `ESC[C` 拆成孤零零一个 ESC，于是每按一次方向键都被当成 Esc。
+      # 走 1 秒的代价只落在"单独按 Esc"上（要等满 1 秒），方向键因为后续字节
+      # 本来就在队列里，第一次 read 就返回，感觉不到延迟。
+      rest=""
+      local c
+      while IFS= read -rsn1 -t 1 c; do
+        rest="$rest$c"
+        case "$c" in [A-Za-z]|'~') break ;; esac
+      done
+      key="$key$rest"
+    fi
+    case "$key" in
+      $'\033[A'|$'\033OA'|k)                       # ↑：选上一条（顺手收起展开）
         [ "${#slugs[@]}" = 0 ] && continue
-        suspend_run "${slugs[$sel]}" cmd_cover "${slugs[$sel]}"
-        last_sel=-1 ;;
-      f)
+        expanded=-1
+        sel=$(( sel > 0 ? sel - 1 : ${#slugs[@]} - 1 )) ;;
+      $'\033[B'|$'\033OB'|j)                       # ↓
         [ "${#slugs[@]}" = 0 ] && continue
-        suspend_run "${slugs[$sel]}" cmd_fix "${slugs[$sel]}"
+        expanded=-1
+        sel=$(( sel < ${#slugs[@]} - 1 ? sel + 1 : 0 )) ;;
+      $'\033[C'|$'\033OC'|l)                       # →：收起时翻页，展开时选下一个命令
+        if [ "$expanded" -ge 0 ]; then
+          cmd_idx=$(( (cmd_idx + 1) % ${#CMD_LABELS[@]} ))
+        else
+          page_down
+        fi ;;
+      $'\033[D'|$'\033OD'|h)                       # ←
+        if [ "$expanded" -ge 0 ]; then
+          cmd_idx=$(( (cmd_idx - 1 + ${#CMD_LABELS[@]}) % ${#CMD_LABELS[@]} ))
+        else
+          page_up
+        fi ;;
+      $'\033[6~'|$'\033[4~') page_down ;;          # PageDown / End
+      $'\033[5~'|$'\033[1~') page_up ;;            # PageUp / Home
+      $'\033')                                     # Esc：收起
+        expanded=-1 ;;
+      ''|$'\n'|$'\r')                              # 回车
+        [ "${#slugs[@]}" = 0 ] && continue
+        if [ "$expanded" -ge 0 ]; then
+          run_cmd "$cmd_idx"
+        else
+          expanded="$sel"; cmd_idx=0
+        fi ;;
+      s)                                           # 换排序：日期 → 名称 → 大小 → 日期
+        case "$sort_key" in
+          date) sort_key=name ;;
+          name) sort_key=size ;;
+          *)    sort_key=date ;;
+        esac
+        apply_sort
+        expanded=-1
         last_sel=-1 ;;
-      r) load_list; last_sel=-1 ;;
+      r) load_list; last_sel=-1; last_exp=-2 ;;
       q|Q) break ;;
     esac
   done
@@ -1214,19 +1585,243 @@ DLL_QUARANTINE='d3d11.dll dxgi.dll d3d10core.dll d3d12.dll d3d9.dll'
 # store/<slug>/meta.tsv 里的一个键（Deck 上读）
 mget() { rsh "sed -n 's/^$2=//p' \"\${HOME}/deckkit/services/games/store/$1/meta.tsv\"" | head -1; }
 
+# 老 NW.js 黑屏的针对性修复：往**这款游戏自己的** package.json 里加
+#   main: www/index.html?canvas        （RPG Maker MV 据此走 Canvas 渲染）
+#   chromium-args: --in-process-gpu --disable-gpu-vsync --ignore-gpu-blacklist
+# 只改这一款游戏（每游戏 play 目录独立），不动别人的启动脚本。
+# 幂等：已经有 chromium-args 就原地替换，不重复加。改前留 .bak。
+fix_nwjs_canvas() {
+  local want="$1" slug gdir
+  slug="$(resolve_slug "$want")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+  gdir="$(mget "$slug" "game_dir")"
+  [ -n "$gdir" ] || gdir="$(dirname "$(mget "$slug" game_exe)")"
+  [ -n "$gdir" ] || die "记录里没有游戏目录（meta.tsv 不全）"
+
+  hdr "老 NW.js 黑屏修复"
+  dim "  游戏目录 $gdir"
+
+  local pj="$gdir/package.json"
+  if ! rsh "test -f \"$pj\""; then
+    bad "游戏目录里没有 package.json —— 这不是 NW.js 打包的游戏，这条对策不适用"
+    dim "  （它可能是别的引擎：Unity / RPG Maker VX Ace / Electron… 各有各的解法）"
+    return 1
+  fi
+
+  # 先亮出判据，让人确认确实是这一类
+  local flavor; flavor="$(rsh "d=$(printf '%q' "$gdir"); h='';
+    [ -f \"\$d/www/js/rpg_core.js\" ] && h='RPG Maker MV';
+    [ -f \"\$d/nw.pak\" ] && [ ! -f \"\$d/nw.dll\" ] && h=\"\$h 老NW.js\";
+    [ -f \"\$d/ffmpegsumo.dll\" ] && h=\"\$h ffmpegsumo\";
+    printf '%s' \"\$h\"" 2>/dev/null | sed 's/^ //')"
+  [ -n "$flavor" ] && dim "  检测到：${flavor// /、}"
+
+  # 备份：**只在文件还是原版时**留一份 .deckkit-orig。
+  # 踩过的坑：如果先前手改过 package.json（比如调试时），无条件 cp 会把"已经改过的"
+  # 当成原版存下来 —— 之后 --nwjs-canvas-undo 还原出来还是改过的，等于没还原。
+  # 判据：原版既没有 chromium-args，main 里也没有 ?canvas。
+  # 若不是原版但也没有 .deckkit-orig，说明修复是别人手做的 —— 明确告诉用户，
+  # 别让 undo 假装能还原。
+  local pristine
+  pristine="$(rsh "python3 -c \"
+import json,sys
+try:
+    d=json.load(open('$pj'))
+    m=d.get('main') or ''
+    ok = (not d.get('chromium-args')) and ('?canvas' not in m)
+    print('yes' if ok else 'no')
+except Exception:
+    print('unknown')
+\"" 2>/dev/null | head -1)"
+  case "$pristine" in
+    yes)
+      rsh "test -f \"$pj.deckkit-orig\" || cp -a \"$pj\" \"$pj.deckkit-orig\"" || die "备份 package.json 失败"
+      ;;
+    no)
+      if ! rsh "test -f \"$pj.deckkit-orig\""; then
+        warn "这个 package.json 已经不是原版了（有 chromium-args 或 ?canvas）"
+        dim "  没有干净的原版可备份 → 本次不留 .deckkit-orig（--nwjs-canvas-undo 将无处可还原）"
+        dim "  要拿到原版：从安装包/原目录重新拷一份覆盖，或 deck games add 重装"
+      fi
+      ;;
+    *)
+      dim "  package.json 读不出来，跳过备份"
+      ;;
+  esac
+
+  # 改：main 带 ?canvas；chromium-args 换成我们这组（幂等替换）
+  local py="$gdir/.deckkit-nwjs-fix.py"
+  rsh "cat > \"$py\"" <<PYEOF
+import json, io, sys
+p = sys.argv[1]
+args = sys.argv[2]
+with io.open(p, encoding="utf-8") as fh:
+    d = json.load(fh)
+m = d.get("main") or "www/index.html"
+if "?" not in m:
+    m = m + "?canvas"
+elif "canvas" not in m.split("?", 1)[1]:
+    m = m + "&canvas"
+d["main"] = m
+d["chromium-args"] = args
+with io.open(p, "w", encoding="utf-8") as fh:
+    json.dump(d, fh, ensure_ascii=False, indent=4)
+    fh.write("\n")
+print("main=" + m)
+print("chromium-args=" + args)
+PYEOF
+  rsh "python3 \"$py\" \"$pj\" \"$NWJS_CANVAS_ARGS\"" || { bad "改 package.json 失败"; return 1; }
+  rsh "rm -f \"$py\"" 2>/dev/null
+
+  ok "已写入（原文件备份为 package.json.deckkit-orig）"
+  dim "  main          → 带 ?canvas（RPG Maker MV 走 Canvas 渲染）"
+  dim "  chromium-args → $NWJS_CANVAS_ARGS"
+  say ""
+  dim "  现在启动试一次：deck games run ${slug}（或直接在 Steam 里点）"
+  dim "  要还原：deck games fix ${slug} --nwjs-canvas-undo"
+}
+
+# 撤销上面的改动（从 .deckkit-orig 还原）
+fix_nwjs_canvas_undo() {
+  local want="$1" slug gdir
+  slug="$(resolve_slug "$want")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录"
+  gdir="$(mget "$slug" "game_dir")"
+  [ -n "$gdir" ] || gdir="$(dirname "$(mget "$slug" game_exe)")"
+  local pj="$gdir/package.json"
+  if ! rsh "test -f \"$pj.deckkit-orig\""; then
+    warn "没有备份可还原（$pj.deckkit-orig 不存在）"
+    dim "  常见原因：修复前 package.json 就已经是改过的（没有干净原版可留）"
+    dim "  要拿回原版：从安装包/原目录重新拷一份，或 deck games add 重装后用 --nwjs-canvas 重做"
+    return 1
+  fi
+  rsh "cp -a \"$pj.deckkit-orig\" \"$pj\"" || die "还原失败"
+  ok "已还原 package.json（${slug}）"
+}
+
+
+# ───────── 两个"点了没反应 / 干脆起不来"的老坑（deck games fix 会自动查）─────────
+# 共同点：游戏数据没错、是环境没配好，所以只在 Deck 侧动游戏自己的配置或文件名。
+#
+# ※ NW.js 关了 GPU → RPG Maker MZ 没有 WebGL
+#    MZ 官方默认的 `chromium-args` 里有 `--disable-gpu`，再加一个
+#    `--disable-software-rasterizer`（实测见到的写法还是畸形的 `=0`）之后，
+#    Chromium 连软件 WebGL 都没了 —— 而 MZ（PixiJS）硬要 WebGL，于是只有
+#      "Error / Your browser does not support WebGL."
+#    去掉这两个就正常（ANGLE → Wine 的 D3D11 → DXVK）。**别动 `--no-sandbox`**：
+#    那是让 Chromium 能在 Wine 里起来的关键。
+#
+# ※ macOS 中转留下的 NFD 文件名
+#    macOS 的文件系统把名字存成 NFD（`ゾ` = U+30BD + U+3099），游戏数据里写的是
+#    NFC（U+30BE）→ 引擎按数据拼路径 404。实测 MZ：磁盘上叫 `ロリマゾBGM/…`，
+#    数据里要 `MyGameBGM/A.D.ENDによるクラシック.ogg_`，卡在 "Failed to load"。
+#    纯 ASCII 名字不受影响，所以只挑带浊点的日文名犯 —— 不查根本看不出来。
+
+fix_deploy_nfc() {
+  rsync -a "$DECK_DIR/nfc-names.py" "$DECK_SSH:$DECK_GAMES_ROOT/nfc-names.py" >/dev/null 2>&1 \
+    || { warn "上传 nfc-names.py 失败"; return 1; }
+  rsh "chmod 755 \"\${HOME}/deckkit/services/games/nfc-names.py\"" 2>/dev/null
+}
+
+game_dir_of_slug() {
+  local slug="$1" g
+  g="$(mget "$slug" "game_dir")"
+  [ -n "$g" ] || g="$(dirname "$(mget "$slug" game_exe)")"
+  printf '%s' "$g"
+}
+
+fix_nwjs_webgl() {
+  local want="$1" slug gdir pj args
+  slug="$(resolve_slug "$want")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+  gdir="$(game_dir_of_slug "$slug")"; [ -n "$gdir" ] || die "记录里没有游戏目录（meta.tsv 不全）"
+  pj="$gdir/package.json"
+  if ! rsh "test -f \"$pj\""; then
+    dim "  没有 package.json —— 不是 NW.js 打包的，跳过"
+    return 0
+  fi
+  args="$(rsh "python3 -c \"
+import json
+print((json.load(open('$pj')).get('chromium-args') or ''))
+\"" 2>/dev/null | tr -d '\r' | tail -1)"
+  case "$args" in
+    *--disable-gpu*|*--disable-software-rasterizer*)
+      rsh "test -f \"$pj.deckkit-orig\"" || rsh "cp -a \"$pj\" \"$pj.deckkit-orig\""
+      local out
+      out="$(rsh "python3 -c \"
+import json
+p='$pj'
+d=json.load(open(p))
+keep=[a for a in (d.get('chromium-args') or '').split()
+      if a!='--disable-gpu' and a!='--disable-gpu-compositing'
+      and not a.startswith('--disable-software-rasterizer')]
+d['chromium-args']=' '.join(keep)
+json.dump(d, open(p,'w'), ensure_ascii=False, indent=4)
+print(' '.join(keep))
+\"" 2>/dev/null | tr -d '\r' | tail -1)"
+      ok "去掉关 GPU / 软件光栅的参数（MZ 要 WebGL）"
+      dim "  新 args：$out"
+      dim "  原件备份：$pj.deckkit-orig"
+      ;;
+    *) dim "  WebGL 参数正常（无需处理）" ;;
+  esac
+  return 0
+}
+
+fix_nfc_names() {
+  local want="$1" slug gdir before after
+  slug="$(resolve_slug "$want")"
+  [ -n "$slug" ] || die "没有叫「${want}」的记录。deck games ls 看看有哪些"
+  gdir="$(game_dir_of_slug "$slug")"; [ -n "$gdir" ] || die "记录里没有游戏目录（meta.tsv 不全）"
+  fix_deploy_nfc || return 0
+  before="$(rsh "python3 \"\${HOME}/deckkit/services/games/nfc-names.py\" \"$gdir\" --check --quiet" 2>/dev/null | tr -d '\r' | tail -1)"
+  case "${before:-0}" in
+    0|'') dim "  文件名都是 NFC（正常）"; return 0 ;;
+  esac
+  rsh "python3 \"\${HOME}/deckkit/services/games/nfc-names.py\" \"$gdir\" --quiet >/dev/null 2>&1"
+  after="$(rsh "python3 \"\${HOME}/deckkit/services/games/nfc-names.py\" \"$gdir\" --check --quiet" 2>/dev/null | tr -d '\r' | tail -1)"
+  ok "NFD→NFC 规范化 $before 个名字（现在还剩 ${after:-0} 个）"
+  dim "  只改名字形式、不动内容；undo 表在 deck 的 /tmp/deckkit-nfc-undo.tsv"
+  return 0
+}
+
 cmd_fix() {
-  local want="" exeopt="" nocover=0
+  local want="" exeopt="" nocover=0 nwjs_canvas=0 nwjs_undo=0 only_webgl=0 only_nfc=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --exe) shift; exeopt="${1:-}" ;;
       --no-cover) nocover=1 ;;
+      --nwjs-canvas) nwjs_canvas=1 ;;   # 老 NW.js 黑屏：给这款游戏加 Canvas/合成参数
+      --nwjs-canvas-undo) nwjs_undo=1 ;;  # 撤销上面的改动
+      --nwjs-webgl) only_webgl=1 ;;      # MZ/NW.js 报 "does not support WebGL"
+      --nfc-names) only_nfc=1 ;;         # macOS 中转的 NFD 文件名 → NFC
       -*) die "fix: 不认识的选项 $1" ;;
       *) want="$1" ;;
     esac
     shift
   done
-  [ -n "$want" ] || die "用法：deck games fix <名字|all> [--exe <相对游戏目录的路径>]"
+  [ -n "$want" ] || die "用法：deck games fix <名字|all> [--exe <相对游戏目录的路径>] [--nwjs-canvas|--nwjs-canvas-undo|--nwjs-webgl|--nfc-names]"
   require_deck
+
+  if [ "$nwjs_undo" = 1 ]; then
+    fix_nwjs_canvas_undo "$want"
+    return $?
+  fi
+
+  # --nwjs-canvas：只给指定游戏（不支持 all —— 这是针对单款游戏的黑屏对策，
+  # 而且它要改游戏自己的 package.json，批量改风险太大）
+  if [ "$nwjs_canvas" = 1 ]; then
+    [ "$want" = all ] && die "--nwjs-canvas 不能对 all 用（它要改游戏自己的 package.json）—— 指定一款游戏"
+    fix_nwjs_canvas "$want"
+    return $?
+  fi
+
+  if [ "$only_webgl" = 1 ] || [ "$only_nfc" = 1 ]; then
+    [ "$want" = all ] && die "这两项要改游戏自己的文件，不能对 all 用 —— 指定一款游戏"
+    if [ "$only_webgl" = 1 ]; then hdr "NW.js WebGL 参数"; fix_nwjs_webgl "$want"; fi
+    if [ "$only_nfc" = 1 ]; then hdr "文件名 NFD → NFC"; fix_nfc_names "$want"; fi
+    return 0
+  fi
 
   local slugs="" r
   if [ "$want" = all ]; then
@@ -1281,6 +1876,10 @@ cmd_fix() {
     dd="$(rsh "ls \"$gdir\"/*.dll.deckkit-off 2>/dev/null | xargs -r -n1 basename | tr '\n' ' '")"
     [ -n "$dd" ] && dim "  已挪开（想改回来就把 .deckkit-off 后缀去掉）：$dd"
 
+    # NW.js 关了 GPU → MZ 没有 WebGL；macOS 中转的 NFD 文件名 → 引擎 404
+    fix_nwjs_webgl "$slug" | sed 's/^/  /'
+    fix_nfc_names "$slug" | sed 's/^/  /'
+
     # ③ 主程序换了 → 图标/封面跟着重做
     if [ "$newexe" != "$oldexe" ] && [ "$nocover" = 0 ]; then
       cmd_cover "$slug" --quiet --reicon || warn "封面没重做（不影响游戏）"
@@ -1314,6 +1913,43 @@ deck_find_art() {
   [ -n "$gdir" ] || return 1
   rsh "find \"$gdir\" -maxdepth 3 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' \) -printf '%s\t%p\n' 2>/dev/null | sort -rn" \
     | awk -F'\t' 'tolower($2) ~ /(title|cover|box|package|jacket|logo|表紙|パッケージ|タイトル)/ {print $2; exit}'
+}
+
+# 「游戏自己的图标」优先于「exe 里抠的」。
+# 为什么：NW.js 打包的 RPG Maker MV 游戏，`Game.exe` 是**引擎的通用启动器**，
+# 资源段里嵌的是 **RPG Maker MV 的官方标志**（戴学士帽拿剑的 Q 版小人），
+# 不是这款游戏的美术。实测 MyGame8：exe 抠出 256x256 的引擎标志，而游戏真正的
+# 立绘在 `www/icon/icon.png`（128x128，角色图）—— 两者 md5 完全不同，封面就错了。
+# 这不是 MyGame8 独有：所有 NW.js 的 MV 游戏（含 deckkit 里正常那个
+# Some Game 3）都会中招，因为 peicon.py 只认 exe 资源段，
+# 不知道 NW.js 这个约定。
+#
+# 判据（NW.js 的官方约定，写在 package.json 里）：
+#   window.icon → 相对游戏目录的路径（通常就是 www/icon/icon.png）
+# 输出：Deck 上的绝对路径（找不到就输出空，让调用方退回 exe 抠图）
+game_own_icon() {
+  local gdir="$1"
+  rsh "python3 -c \"
+import json, os, sys
+g = sys.argv[1]
+cands = []
+try:
+    pj = os.path.join(g, 'package.json')
+    if os.path.isfile(pj):
+        with open(pj, encoding='utf-8') as fh:
+            d = json.load(fh)
+        ic = (d.get('window') or {}).get('icon')
+        if ic:
+            cands.append(ic if os.path.isabs(ic) else os.path.join(g, ic))
+except Exception:
+    pass
+# 约定俗成的兜底位置（package.json 没写 icon 时）
+cands += [os.path.join(g, 'www/icon/icon.png'), os.path.join(g, 'icon.png')]
+for c in cands:
+    c = os.path.normpath(c)
+    if os.path.isfile(c) and os.path.getsize(c) > 1024:
+        print(c); break
+\" $(printf '%q' "$gdir")" 2>/dev/null | head -1
 }
 
 cmd_cover() {
@@ -1375,22 +2011,41 @@ cmd_cover() {
     fi
     if [ -n "$image" ] && [ ! -f "$image" ]; then die "找不到图片：$image"; fi
 
-    # 图标：先从主程序 exe 里抠一份存到 store（缓存，下次直接用），再拉到 Mac 渲染
+    # 图标：**优先用游戏自己的**（NW.js 的 package.json → window.icon），
+    # 抠 exe 只当兜底 —— exe 里嵌的往往是引擎标志，不是这款游戏的美术。
+    # 缓存到 store（下次直接用），再拉到 Mac 渲染。
     local icon_local="" rexe
     rexe="$(rsh "sed -n 's/^game_exe=//p' \"\${HOME}/deckkit/services/games/store/$slug/meta.tsv\"" | head -1)"
     if [ "$no_icon" = 0 ] && [ -z "$image" ]; then
       [ "$reicon" = 1 ] && rsh "rm -f \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null
-      if ! rsh "test -s \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null && [ -n "$rexe" ]; then
-        rsh "python3 \"$DECK_GAMES_ABS/peicon.py\" \"$rexe\" --best \"$DECK_GAMES_ABS/store/$slug/icon.png\"" >/dev/null 2>&1 || true
+      if ! rsh "test -s \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null; then
+        # ① 游戏自己的图标（最准）
+        local own; own="$(game_own_icon "$gdir" || true)"
+        if [ -n "$own" ]; then
+          rsh "python3 -c \"
+import sys, shutil
+src, dst = sys.argv[1], sys.argv[2]
+try:
+    shutil.copyfile(src, dst)
+except Exception:
+    pass
+\" $(printf '%q' "$own") \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null || true
+          [ "$quiet" = 1 ] || dim "  图标来源：游戏自己的（$(basename "$own")）"
+        fi
+        # ② 兜底：从主程序 exe 抠
+        if ! rsh "test -s \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null && [ -n "$rexe" ]; then
+          rsh "python3 \"$DECK_GAMES_ABS/peicon.py\" \"$rexe\" --best \"$DECK_GAMES_ABS/store/$slug/icon.png\"" >/dev/null 2>&1 || true
+          [ "$quiet" = 1 ] || dim "  图标来源：主程序 exe（游戏没自带图标）"
+        fi
       fi
       if rsh "test -s \"$DECK_GAMES_ABS/store/$slug/icon.png\"" 2>/dev/null; then
         mkdir -p "$COVER_TMP/$appid"
         if scp -q "${SSH_OPTS[@]}" "$DECK_SSH:$DECK_GAMES_ABS/store/$slug/icon.png" "$COVER_TMP/$appid/icon.png" 2>/dev/null; then
           icon_local="$COVER_TMP/$appid/icon.png"
-          [ "$quiet" = 1 ] || dim "  图标：主程序自带（$(sips -g pixelWidth "$icon_local" 2>/dev/null | tail -1 | tr -dc 0-9)px）"
+          [ "$quiet" = 1 ] || dim "  图标 $(sips -g pixelWidth "$icon_local" 2>/dev/null | tail -1 | tr -dc 0-9)px"
         fi
       else
-        [ "$quiet" = 1 ] || dim "  主程序里没有图标资源，退回排版封面"
+        [ "$quiet" = 1 ] || dim "  没有可用图标，退回排版封面"
       fi
     fi
 
@@ -1450,17 +2105,16 @@ cmd_cover() {
   dim "  Steam 正在跑的话，重启 Steam（或切一次 Gaming/桌面模式）才看得到新封面"
 }
 
+
 cmd_help() {
   cat <<'EOF'
-    deck games              游戏管理（终端里是方向键列表：↑↓ 选、回车卸载、q 退出）
+    deck games              游戏管理（方向键列表：↑↓ 选、←→ 翻页、回车 展开、s 换排序、q 退出）
     deck games ls           只列已装的游戏（脚本里用这个）
     deck games add <exe>    装（自动切桌面模式、杀 Steam、装完收尾）
     deck games add <主程序.exe>  免安装游戏（按主程序定位目录 → 拷到 Deck → 登记 Steam）
     deck games rm <名字>     卸载（Steam 列表条目 + 游戏本体一起清）
     deck games cover <名字|all>  生成封面写进 Steam 的 grid（装完会自动做；用主程序自带图标）
-    deck games fix <名字|all>    维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK（点开始没反应时先跑它）
-    deck games pad [<名字|all>]  手柄布局：右摇杆当鼠标等（--list 看现状，--template 选模板）
-                                 也能改 Steam 正版：deck games pad --appid 2739590 -t mouse
+    deck games fix <名字|all>    维修：重挑主程序 + 挪开自带的 Windows 版 DXVK + 修 WebGL 参数 + 修 NFD 文件名
 EOF
   dim "  其它：deck games shortcut <名字> 只登记 Steam 条目 / protons / verify；全部：deck games help-all"
 }
@@ -1493,9 +2147,9 @@ case "${1:-}" in
   add)            shift; cmd_install "$@" ;;      # 简写：deck games add <exe>
   cover)          shift; cmd_cover "$@" ;;        # 生成立绘/封面写进 Steam 的 grid 目录
   fix)            shift; cmd_fix "$@" ;;          # 维修：重挑主程序 + 挪开游戏自带的 Windows 版 DXVK
-  pad)            shift; cmd_pad "$@" ;;          # 手柄布局（Steam Input）：把右摇杆当鼠标等
   rm|del|remove)  shift; cmd_rm "$@" ;;           # 简写：deck games rm <名字>（条目+本体一起删）
   clean)          cmd_clean ;;                    # 清掉残留的"已卸载"记录
+  fonts)          shift; cmd_fonts "${1:-install}" "$@" ;;   # 汉化游戏中文字形（Wine/Proton 层 + fontconfig 别名）
   help|--help|-h) cmd_help ;;
   help-all)       cmd_help_all ;;
   shortcut-check) cmd_shortcut_check ;;

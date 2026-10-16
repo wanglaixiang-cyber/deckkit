@@ -4,8 +4,8 @@
 为什么需要：macOS 的文件系统把名字存成 **NFD**（`ゾ` = U+30BD `ソ` + U+3099 组合浊点），
 而游戏自己的数据（`data/*.json`、脚本、配置）里写的是 **NFC**（U+30BE `ゾ`）。
 用 macOS 当"中转站"拷过来的游戏就会出现「数据里 NFC、磁盘上 NFD」→ 引擎按数据拼
-路径时 404。实测：RPG Maker MZ 的 `MyGameBGM/A.D.ENDによるクラシック.ogg_`
-在磁盘上叫 `ロリマゾBGM/…`，游戏直接停在 "Failed to load"。
+路径时 404。实测：RPG Maker MZ 的 `Some Game 2BGM/A.D.ENDによるクラシック.ogg_`
+在磁盘上叫 `Some Game 2BGM/…`，游戏直接停在 "Failed to load"。
 （ASCII 名字不受影响，所以这类问题只挑日文/带浊点的名字犯，很难一眼看出来。）
 
 用法：

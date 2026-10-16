@@ -78,7 +78,7 @@
 ## 快速上手
 
 ```bash
-cd "$HOME/PycharmProjects/ezviz-backup"
+cd "~/PycharmProjects/untitled folder/ezviz-backup"
 
 # 1) 打标签 —— 二选一
 #    访达里：右键文件夹 → 最上面那排彩色圆点 → 选「备份」

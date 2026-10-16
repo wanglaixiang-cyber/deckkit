@@ -254,7 +254,7 @@ installer_fingerprint() {   # 在二进制里找安装器自己的招牌字符�
 }
 
 # —— 老 NW.js 检测（RPG Maker MV 黑屏高发组合）——
-# 实测 MyGame8：RPG Maker MV + **老版 NW.js**（Chromium 41，2016）在 Proton 下会
+# 实测 Some Game 1：RPG Maker MV + **老版 NW.js**（Chromium 41，2016）在 Proton 下会
 # 「有声无画」：游戏逻辑、场景、地图、渲染全部正常，canvas 里确实画出了画面
 # （探针读到非黑像素 8.84%），但那一帧送不到窗口/合成器 → 屏幕全黑，
 # 而音频与按键照常（不走渲染路径）。典型表现是**开头出一帧封面，之后就黑**。
@@ -262,7 +262,7 @@ installer_fingerprint() {   # 在二进制里找安装器自己的招牌字符�
 # 判据全在**文件布局**上，`ls` 就能看出来，**装的时候零成本可查**：
 #   老版 NW.js: 有 nw.pak + ffmpegsumo.dll，**没有** nw.dll / nw_100_percent.pak
 #   新版 NW.js: 有 nw.dll + nw_100_percent.pak，没有 ffmpegsumo.dll（已并进去）
-# 实测对照：MyGame8（老，黑屏）vs Some Game 3（新，正常）判据完全相反。
+# 实测对照：Some Game 1（老，黑屏）vs Some Game 14（新，正常）判据完全相反。
 #
 # 注意分寸：这只是**风险标签，不是结论** —— 老 NW.js 不必然黑屏（deckkit 里
 # 别的老引擎游戏就没事），黑不黑是「老 NW.js × Proton × 合成路径」的组合结果。
@@ -486,7 +486,7 @@ EOF
 
 # 免安装游戏（主线）：你给**主程序 exe**，游戏目录 = 它所在那一层（--root 可以挪）。
 # 为什么不让你选文件夹：一个目录里常有好几个 exe（汉化版/原版/不同版本/崩溃处理器），
-# 让程序"按体积猜"猜错是必然 —— 实测 MyGame3 被 UnityCrashHandler32.exe 骗过。
+# 让程序"按体积猜"猜错是必然 —— 实测 轮回电车 被 UnityCrashHandler32.exe 骗过。
 cmd_add_exe() {
   local exe="$1" want="$2" noshortcut="$3" no_session="$4" nocover="$5" rootrel="$6"
   local b srcdir root rel sz
@@ -1303,7 +1303,7 @@ sys.stdout.write("\n".join("\t".join(r) for r in rows) + "\n")
   # 把一页名字按**显示列宽**截断 + 补齐 —— 这是「条目没对齐」的正解。
   #
   # 为什么不能直接用 tui_pad/tui_cut：它们数的是**字符数**（`${#s}`），
-  # 而中日文一个字占 **2 列** —— 于是「MyGame」按 8 个字符补空格，
+  # 而中日文一个字占 **2 列** —— 于是「Some Game 5」按 8 个字符补空格，
   # 实际却占了 16 列，右边的大小列整片错开（列表里中日文行和英文行对不上就是这个）。
   #
   # 交给 python 一次算一整页（不是一行一次调用：那样一屏要 fork 几十次）。
@@ -1574,7 +1574,7 @@ sys.stdout.write("\n".join(out) + "\n")
 # ─────────────────────────── 维修（fix）───────────────────────────
 # 两个实测踩过的坑，这里一次性收拾：
 #   ① 主程序被挑错：`find-game-exe` 只看大小 + 排除表，早先没排 `*CrashHandler*`，
-#      于是 MyGame3 捡到了 UnityCrashHandler32.exe（923KB > 真主程序 640KB）→ 点开始没反应。
+#      于是 轮回电车 捡到了 UnityCrashHandler32.exe（923KB > 真主程序 640KB）→ 点开始没反应。
 #   ② 游戏目录里自带 **Windows 版 DXVK**（`d3d11.dll` 之类，装补丁/ShaderFixes 的 repack
 #      常带）：Wine 的 dll 搜索顺序是"先看程序目录"，于是这份 Windows dll 被加载 →
 #      Proton 下必然崩（实测 Player.log: "GfxDevice: creating device client" 之后 Crash!!，
@@ -1713,8 +1713,8 @@ fix_nwjs_canvas_undo() {
 #
 # ※ macOS 中转留下的 NFD 文件名
 #    macOS 的文件系统把名字存成 NFD（`ゾ` = U+30BD + U+3099），游戏数据里写的是
-#    NFC（U+30BE）→ 引擎按数据拼路径 404。实测 MZ：磁盘上叫 `ロリマゾBGM/…`，
-#    数据里要 `MyGameBGM/A.D.ENDによるクラシック.ogg_`，卡在 "Failed to load"。
+#    NFC（U+30BE）→ 引擎按数据拼路径 404。实测 MZ：磁盘上叫 `Some Game 2BGM/…`，
+#    数据里要 `Some Game 2BGM/A.D.ENDによるクラシック.ogg_`，卡在 "Failed to load"。
 #    纯 ASCII 名字不受影响，所以只挑带浊点的日文名犯 —— 不查根本看不出来。
 
 fix_deploy_nfc() {
@@ -1918,10 +1918,10 @@ deck_find_art() {
 # 「游戏自己的图标」优先于「exe 里抠的」。
 # 为什么：NW.js 打包的 RPG Maker MV 游戏，`Game.exe` 是**引擎的通用启动器**，
 # 资源段里嵌的是 **RPG Maker MV 的官方标志**（戴学士帽拿剑的 Q 版小人），
-# 不是这款游戏的美术。实测 MyGame8：exe 抠出 256x256 的引擎标志，而游戏真正的
+# 不是这款游戏的美术。实测 Some Game 1：exe 抠出 256x256 的引擎标志，而游戏真正的
 # 立绘在 `www/icon/icon.png`（128x128，角色图）—— 两者 md5 完全不同，封面就错了。
-# 这不是 MyGame8 独有：所有 NW.js 的 MV 游戏（含 deckkit 里正常那个
-# Some Game 3）都会中招，因为 peicon.py 只认 exe 资源段，
+# 这不是 Some Game 1 独有：所有 NW.js 的 MV 游戏（含 deckkit 里正常那个
+# Some Game 14）都会中招，因为 peicon.py 只认 exe 资源段，
 # 不知道 NW.js 这个约定。
 #
 # 判据（NW.js 的官方约定，写在 package.json 里）：

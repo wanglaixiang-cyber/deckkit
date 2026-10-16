@@ -13,7 +13,7 @@
 #   · Proton 自带的 files/share/fonts/msgothic.ttc **不是** MS Gothic，而是
 #     Ume-Gothic（14963 字形，只有 JIS）。「头/开/结/戏/环/继/续」一个都没有：
 #       $ python3 -c "..." → '从新·始境束游····置·存档'
-#     SRPG Studio 系汉化游戏（MyGame/交響曲/協奏曲/終曲、鎮魂歌）把 UI
+#     SRPG Studio 系汉化游戏（Some Game 5/交響曲/協奏曲/終曲、鎮魂歌）把 UI
 #     字体写死在 data.dts 项目段里，值就是 "MS Gothic" → 游戏里直接**空白**。
 #   · 終曲那款项目段里没写字体，引擎退回写死在 game.exe 里的 "Meiryo UI"；
 #     prefix 里没有这个 family → 豆腐块。

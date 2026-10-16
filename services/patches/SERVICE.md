@@ -39,7 +39,7 @@ deck patches install                 # Deck 侧准备（建库 + 推 patchctl.sh
 ## 为什么不是「让 exe 自己在 Deck 上解压」
 
 补丁 exe 是 Windows 世界的东西，它的安装脚本用 Windows 路径描述目标。实测
-`Some Game 2 CN Patch v1.01.exe`（Setup Factory）内部的 Lua：
+`Some Game 11 CN Patch v1.01.exe`（Setup Factory）内部的 Lua：
 
 ```lua
 reg_test = Registry.GetValue(HKLM, "Software\WOW6432Node\Kagura Games\"..regName, "Install_Path")
@@ -135,7 +135,7 @@ deck patches mount-file '<补丁.exe>'
 
 | 环节 | 做法 |
 |---|---|
-| 目标游戏 | 安装器型**没有文件清单可比对**，只能按**补丁文件名**猜：游戏名整段命中 +6、共享 ≥4 字符的 ASCII 词（Milky/Quest/SOULS…）+1、共享 ≥2 字的中文/日文片段（MyGame3…）+3；只有「最高分 > 0 且严格高过第二名」才采用。猜中会打印出来，不放心就 `--game` 写死 |
+| 目标游戏 | 安装器型**没有文件清单可比对**，只能按**补丁文件名**猜：游戏名整段命中 +6、共享 ≥4 字符的 ASCII 词（Milky/Quest/SOULS…）+1、共享 ≥2 字的中文/日文片段（轮回电车…）+3；只有「最高分 > 0 且严格高过第二名」才采用。猜中会打印出来，不放心就 `--game` 写死 |
 | 会话 | **只要桌面模式**（向导要开窗）。补丁不写 `shortcuts.vdf`，所以**不动 Steam** —— 这一点和 games 的安装流程不一样 |
 | prefix | 用**游戏自己的** `compatdata/<appid>`：很多补丁的安装脚本先读游戏写下的注册表键才认得出游戏目录；换个 prefix 就会「装完了但游戏目录一个字节都没变」。用的是**游戏自己的** prefix，所以补丁眼里这台"电脑"就是装过该游戏的那台 |
 | 拉起向导 | cwd = 游戏目录；`DISPLAY`/`XAUTHORITY` 从桌面会话进程里读；**关掉 Xalia**（`PROTON_USE_XALIA=0`，否则崩溃、窗口永不出现）；输出写**统一日志**（`~/deckkit/logs/patches-installer.log`，读：`deck logs patches-installer`；`deck-log` 不在才退回 `~/deckkit/services/patches/installer.log`），不继承 ssh 管道。这一步**阻塞**，等到安装器进程退出才返回 |
@@ -157,15 +157,15 @@ deck patches mount-file '<补丁.exe>'
 | `plain` | 没有明显附加数据 | 解包（多半本来就能解） |
 | `not_pe` | 不是 PE（zip/7z/文件夹） | 直接解包 |
 
-实测：`Some Game 3 Full ver patch CH.exe`（479MB，代码段仅 0.2MB、
+实测：`Some Game 14 Full ver patch CH.exe`（479MB，代码段仅 0.2MB、
 尾部 479.3MB 高熵）被判 `selfextract` → 转安装器流程；
-`Another Game CN patch.exe` 等能解的被判 `plain` → 照旧走解包，**没有回归**。
+`Some Game 9 CN patch.exe` 等能解的被判 `plain` → 照旧走解包，**没有回归**。
 
-**⚠️ 状态：代码写完、冒烟测试过了；真实安装器样本（Some Game 3 官方汉化补丁）
+**⚠️ 状态：代码写完、冒烟测试过了；真实安装器样本（Some Game 14 官方汉化补丁）
 已能正确分诊并转进这条路，但「向导真正把文件装进游戏目录」还待实测验收。**
 
 冒烟测到的（用一个**不是有效 exe** 的假安装器，正因如此游戏目录一个文件都没变）：
-目标游戏按名字猜中（`MyGame2 …`，appid 2689242455）→ 快照到 58 个文件 →
+目标游戏按名字猜中（`阳光下的真实 …`，appid 2689242455）→ 快照到 58 个文件 →
 用的是游戏自己的 prefix、cwd 正确、`DISPLAY=:0` / `XAUTHORITY` 解析到、Xalia 关掉、
 Proton 11.0 起来、日志落盘 → 0 个文件变化时给出「安装器大概装到别处去了」的提示 →
 安装器副本按配置删掉 → 记录 `kind=installer`。diff 那一段另外单独验过：
@@ -180,7 +180,7 @@ Proton 11.0 起来、日志落盘 → 0 个文件变化时给出「安装器大�
 - 安装器可能把东西装进 prefix（它以为 `%ProgramFilesFolder%` 就是游戏目录）——
   那样「安装结果」会是 0 个文件，命令会提示你在向导里把路径指到游戏目录
   （Proton 下就是 `Z:` 开头的那条真实路径）。
-- **别指望安装器会自己找到游戏目录。** 实测 `Some Game 3 Full ver patch CH.exe`
+- **别指望安装器会自己找到游戏目录。** 实测 `Some Game 14 Full ver patch CH.exe`
   （私有自解压器、VC++ 写的）代码段里**只有通用 Win32 串**，既没有 `OTAKU_Plan` /
   `bikini` 这类游戏专属键名，也只读 `Software\Microsoft\Windows\CurrentVersion`
   拿 `ProgramFilesDir`。也就是说：**它不读游戏注册的 `install_path`**，
@@ -192,7 +192,7 @@ Proton 11.0 起来、日志落盘 → 0 个文件变化时给出「安装器大�
   非 Steam 游戏只能回 Mac 重拷。
 - **不能用 mtime 找"刚装进去的文件"**（踩过，已修）：很多安装器/自解压器把文件
   时间戳设成**打包时的时间**（作者那边），于是新写入的文件 mtime 反而比"安装开始
-  时刻"更早 → `find -newermt @since` 一个都匹配不到。实测 Some Game 3
+  时刻"更早 → `find -newermt @since` 一个都匹配不到。实测 Some Game 14
   官方汉化补丁：装进去 1467 个文件，时间戳全是补丁打包时的 `01:12~01:14`，
   而安装动作发生在 `03:03` → 旧写法只命中 2 个（游戏自己写的 `debug.log` /
   存档），manifest 记成 **0 条**，`status` 显示「0 个文件 · 状态未知」，
@@ -235,15 +235,15 @@ Proton 11.0 起来、日志落盘 → 0 个文件变化时给出「安装器大�
   **没有用 md5 内容比对当判据**：补丁一旦挂载，文件内容就等于 manifest，而且
   坏挂载会污染内容（实测二代被一代补丁覆盖后，二代**自己的**补丁都比对不上），
   内容比对既分不出"打对了已挂载"和"打错了被覆盖"，还会给出反向结论。
-- **同名系列作必须用 `--game` 指定**（实测踩过：`Another Game` 一代补丁被挂到
-  `Another Game 2` 上）。两代同引擎、同顶层目录结构，前作补丁的路径在续作目录里
+- **同名系列作必须用 `--game` 指定**（实测踩过：`Some Game 9` 一代补丁被挂到
+  `Some Game 9 II` 上）。两代同引擎、同顶层目录结构，前作补丁的路径在续作目录里
   **63/63 全部命中**，而前作自己只命中 2 个 —— "命中最多者胜"必然倒向续作。
   更麻烦的是**这种误判看起来极其可信**：赢家 100%、输家 3%，比分悬殊到任何
   "比例/并列"检查都不会报警。所以只要候选里出现名字互为前缀的一对
-  （`Another Game` ⊂ `Another Game 2`）且两边都有命中，服务就**拒绝自动选**，
+  （`Some Game 9` ⊂ `Some Game 9 II`）且两边都有命中，服务就**拒绝自动选**，
   直接把两个候选和各自命中数打出来，要求你 `--game` 指定。
   实测两个方向都会被拦（一代补丁 2 vs 63、二代补丁 3 vs 144），
-  而 `--game` 一旦给了就不再追问。非系列作不受影响（Some Game 2 照常自动选中）。
+  而 `--game` 一旦给了就不再追问。非系列作不受影响（Some Game 11 照常自动选中）。
 
 ## 菜单栏
 

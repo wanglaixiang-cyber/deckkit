@@ -42,12 +42,12 @@ deck games fonts                       # 汉化游戏中文字形（Wine/Proton 
 
 | 环节 | 做法 |
 |---|---|
-| 定位游戏目录 | **你选的主程序在哪儿，游戏目录就是哪一层**（不用猜）。一个目录里常有好几个 exe（汉化版/原版/不同版本/`UnityCrashHandler32.exe`），「按体积挑」猜错是必然 —— 实测 MyGame3 就是这么装错的。`--root ..` 可以往上一层（主程序在 `bin/`、数据在外面的情况） |
+| 定位游戏目录 | **你选的主程序在哪儿，游戏目录就是哪一层**（不用猜）。一个目录里常有好几个 exe（汉化版/原版/不同版本/`UnityCrashHandler32.exe`），「按体积挑」猜错是必然 —— 实测 轮回电车 就是这么装错的。`--root ..` 可以往上一层（主程序在 `bin/`、数据在外面的情况） |
 | 选中就判定 | 名字像 `*CrashHandler*`/`unins*`/`setup*`/redist → **直接拒绝**；同层还有别的 exe → 提示「同目录还有 X，确认跑的是这个」；exe < 32KB（引导器）→ 提醒；上一层看着有 `data/`/`*_Data/`/`*.xp3`/`package.json` → 提示 `--root ..`（都是提醒，不拦你） |
 | 拷到 Deck | `tar \| ssh tar -x`（rsync 在 mac/Deck 版本不一致时会翻车）。落 `~/.local/share/deckkit/games/<slug>/game/` —— 和 `run.sh` 同一目录，于是 `deck games rm` 里那条 `rm -rf` 就把游戏本体一起删了，不留残渣 |
 | 拷完复核 | 用**改进后的排除规则**在拷过去的目录里再挑一遍：挑出来的 ≠ 你选的 → 明确告诉你「按规则会挑 Y，起不来就 `deck games fix <名字> --exe Y`」（这就是「选错了也能救」那一步） |
 | macOS 垃圾 | 两个开关都要：`COPYFILE_DISABLE=1`（不加的话 bsdtar 会给每个带 xattr 的文件附一份 AppleDouble `._名字`，.DS_Store 全排除掉也照样落一地）＋ `--no-xattrs`（不加的话 Deck 的 GNU tar 对每个文件刷一行 `Ignoring unknown extended header keyword`，879M 刷出十几万行） |
-| dir slug | 目录名允许中日文（`mygame`），显示名原样进 Steam |
+| dir slug | 目录名允许中日文（`Some Game 5ver1-01`），显示名原样进 Steam |
 | 主程序 | `gamectl find-game-exe --dir <游戏目录>`：排除 unins/setup/redist/… 后取最大的 exe；你点的就是 exe 的话直接用它 |
 | prefix | 照旧先建一个**空的**：第一次启动时 Proton 自己初始化（日志 `Upgrading prefix from None to 11.0-100`） |
 | 会话 | 只有"写 `shortcuts.vdf`"这一步需要 Steam 不在跑（和 `shortcut` 共用），拷贝、挑主程序都不需要 |
@@ -65,15 +65,15 @@ OpenTTD 14.1（8MB NSIS 安装包）：
     → prefix compatdata/2329061293 + drive_c/Program Files/OpenTTD/openttd.exe
     → run.sh ✓ 桌面菜单项 ✓ 记录 ✓ Steam 条目 ✓，切回 Gaming Mode 点开始能玩 ✓
 
-MyGame ver1.01（SRPG Studio，878M 免安装目录）：
-  deck games add '.../MyGame/game.exe'
+Some Game 5 ver1.01（SRPG Studio，878M 免安装目录）：
+  deck games add '.../Some Game 5ver1.01/game.exe'
     → 判定"不像安装包" → 按免安装办：879M 走 tar|ssh 到
-      ~/.local/share/deckkit/games/mygame/game/（2799 个文件，源目录也是 2799，一个不多一个不少）
-    → slug mygame，appid 3608512011，Proton 11.0，空 prefix，game.exe 自动选中
+      ~/.local/share/deckkit/games/Some Game 5ver1-01/game/（2799 个文件，源目录也是 2799，一个不多一个不少）
+    → slug Some Game 5ver1-01，appid 3608512011，Proton 11.0，空 prefix，game.exe 自动选中
     → run.sh ✓ meta.tsv（portable=1、size=879M）✓ Steam 条目 ✓
     → 全过程 36 秒（含 879M 拷贝）
   真能跑（按 Steam 的默认环境：不设 PROTON_LOG 即 WINEDEBUG=-all、DXVK_LOG_LEVEL=none）：
-    run.sh → game.exe 15.9% CPU + 窗口「MyGame」1024x768 ✓
+    run.sh → game.exe 15.9% CPU + 窗口「Some Game 5ver1.01」1024x768 ✓
 ```
 
 ## 封面（`deck games cover`）
@@ -103,9 +103,9 @@ deck games cover <名字> --reicon        # 丢掉缓存的图标，重新取一
 - **图标优先用「游戏自己的」，抠 exe 只当兜底**（顺序见下）。原因是一个实测踩到的坑：
   **NW.js 打包的 RPG Maker MV 游戏，`Game.exe` 是引擎的通用启动器**，资源段里嵌的是
   **RPG Maker MV 的官方标志**（戴学士帽拿剑的 Q 版小人），不是这款游戏的美术。
-  实测 MyGame8：exe 抠出 256×256 的引擎标志，而游戏真正的立绘在 `www/icon/icon.png`
+  实测 Some Game 1：exe 抠出 256×256 的引擎标志，而游戏真正的立绘在 `www/icon/icon.png`
   （128×128，角色图），md5 完全不同 —— 封面就挂了个引擎图标上去。
-  **所有 NW.js 的 MV 游戏都会中招**（含正常那个 Some Game 3）。
+  **所有 NW.js 的 MV 游戏都会中招**（含正常那个 Some Game 14）。
   取图顺序：
   1. `package.json` 的 `window.icon`（NW.js 的官方约定，通常就是 `www/icon/icon.png`）
   2. 兜底约定的 `www/icon/icon.png` / `icon.png`（≥1KB 才算，避开占位小图）
@@ -181,7 +181,7 @@ deck status       # 完整状态（全量 dump）
 | **主程序挑错了**：`find-game-exe` 按"最大的 exe"挑，而 Unity 游戏目录里的 `UnityCrashHandler32.exe`（923KB）比真主程序（640KB）还大 | 启动的是崩溃处理器 → 点开始**彻底没反应**（进程一闪而过） | 排除表加了 `crashhandler / crashreport / steamerrorreporter` 等；`fix` 重挑并重写 `run.sh` + `meta.tsv` |
 | **repack 自带 Windows 版 DXVK**：游戏目录里的 `d3d11.dll`（2.6MB，配 `ShaderFixes/`） | Wine 的 dll 搜索顺序是"程序目录优先" → 这份 Windows dll 被加载 → Proton 下必崩（`Player.log`：`GfxDevice: creating device client` 之后 `Crash!!!` + 访问违例） | 把 `d3d11/dxgi/d3d10core/d3d12/d3d9.dll` 里 **>200KB 的**改名成 `<名字>.deckkit-off`（可逆），让 Proton 自带 DXVK 接管 |
 | **NW.js 关了 GPU**：MZ 官方默认的 `chromium-args` 就有 `--disable-gpu`，再叠一个 `--disable-software-rasterizer`（实测见到的写法还是畸形的 `=0`）之后，Chromium 连**软件 WebGL 都没了** | 窗口正常打开，正中显示 `Error / Your browser does not support WebGL.`（RPG Maker MZ 用 PixiJS，硬要 WebGL，没有就只给这一行） | 从 `package.json` 的 `chromium-args` 里**只摘掉** `--disable-gpu` / `--disable-gpu-compositing` / `--disable-software-rasterizer*`，其余（含 `--no-sandbox`）一行不动；原文件备份 `package.json.deckkit-orig`。摘掉后走 ANGLE → Wine 的 D3D11 → DXVK |
-| **macOS 中转留下的 NFD 文件名**：macOS 文件系统把名字存成 NFD（`ゾ` = `U+30BD` + `U+3099`），而游戏数据（`data/*.json`）里写的是 NFC（`U+30BE`） | 引擎按数据拼路径 → 404 → MZ 停在 `Failed to load audio/bgm/…`（实测：磁盘上叫 `ロリマゾBGM/A.D.END…`，数据要 `MyGameBGM/A.D.END…`）。**纯 ASCII 名字不受影响**，所以只挑带浊点的日文名犯，不看字节根本发现不了 | 跑 `deck/nfc-names.py` 把**整棵游戏目录**的名字规范化成 NFC（从最深的层往上改，先文件后目录），只改名字形式、不动内容；undo 表写在 deck 的 `/tmp/deckkit-nfc-undo.tsv` |
+| **macOS 中转留下的 NFD 文件名**：macOS 文件系统把名字存成 NFD（`ゾ` = `U+30BD` + `U+3099`），而游戏数据（`data/*.json`）里写的是 NFC（`U+30BE`） | 引擎按数据拼路径 → 404 → MZ 停在 `Failed to load audio/bgm/…`（实测：磁盘上叫 `Some Game 2BGM/A.D.END…`，数据要 `Some Game 2BGM/A.D.END…`）。**纯 ASCII 名字不受影响**，所以只挑带浊点的日文名犯，不看字节根本发现不了 | 跑 `deck/nfc-names.py` 把**整棵游戏目录**的名字规范化成 NFC（从最深的层往上改，先文件后目录），只改名字形式、不动内容；undo 表写在 deck 的 `/tmp/deckkit-nfc-undo.tsv` |
 
 只想单独跑某一项：
 
@@ -193,7 +193,7 @@ deck games fix <名字> --nfc-names    # 只查/修 NFD 文件名
 另外，**免安装游戏从 macOS 拷过来时，上传流程本身就会自动做一次 NFD→NFC**
 （`tar` 解包后立刻规范化，报 `规范化 N 个文件名`）—— 上面那条 `--nfc-names` 是给
 "早就装好、后来才发现"的游戏补的。踩过的具体案例：`source_dir` 是
-`/Users/…/Desktop/…` 的那款 MZ 汉化版，磁盘上 135 个名字是 NFD，标题 BGM 直接 404。
+`~/Desktop/…` 的那款 MZ 汉化版，磁盘上 135 个名字是 NFD，标题 BGM 直接 404。
 （`patches` 服务的目录上传没有这一步。）
 
 ```bash
@@ -211,7 +211,7 @@ deck games fix <名字> --nwjs-canvas-undo       # 撤销上一条
 
 **症状**：音乐在放、按键有反应，**画面全黑**。最典型的形态是**开头出一帧封面，之后就黑**。
 
-**原因**（实测 MyGame8 坐实的）：**游戏本身没问题**。注入探针读页面内部状态，得到
+**原因**（实测 Some Game 1 坐实的）：**游戏本身没问题**。注入探针读页面内部状态，得到
 
 ```
 SceneManager._scene = Scene_Map        ← 已进地图，不是卡在标题
@@ -233,7 +233,7 @@ GameCanvas 1280x720，非黑像素 8.84%，中心像素 RGBA(69,57,82)  ← canv
 | `ffmpegsumo.dll` | **有** | 无（并进 nw.dll 了） |
 | `www/js/rpg_core.js` | 有（RPG Maker MV） | 有 |
 
-实测对照：`MyGame8`（老，黑屏）vs `Some Game 3`（新，正常）判据完全相反。
+实测对照：`Some Game 1`（老，黑屏）vs `Some Game 14`（新，正常）判据完全相反。
 `deck games add` 装完会**自动检测并提示**（只提示，不拦、不改参数）：
 
 > ⚠ 检测到「RPG Maker MV、老 NW.js、ffmpegsumo」—— 这类在 Proton 下有黑屏先例
@@ -265,7 +265,7 @@ deck games fix <名字> --nwjs-canvas
 **症状**：中文显示成空白或空心方块，被吃掉的往往是**简体特有字**
 （头 / 开 / 结 / 戏 / 环 / 继 / 续 / 设）。日语部分正常、英文正常 —— 所以一眼看不出是字体问题。
 
-实测（`MyGame 三重奏/交響曲/協奏曲/終曲`、`RJ00000000 鎮魂歌`）：
+实测（`Some Game 2 三重奏/交響曲/協奏曲/終曲`、`RJ00000000 鎮魂歌`）：
 
 | 应当显示 | 实际显示 | 缺的字 |
 |---|---|---|

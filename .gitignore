@@ -4,6 +4,11 @@
 # ─────────────────────────────────────────────────────────────
 _archive/
 
+# 发布用脱敏的真实值：作品名/目录名/设备名 → 占位符。
+# 它**不该进版本库**（那等于把要藏的东西列个清单），也不进公开版
+# （publish.sh 在脱敏前就删掉 .oss/）。用 `python3 .oss/check-titles.py --refresh` 生成。
+.oss/local-values.txt
+
 # 构建产物 —— deck menu 会重新生成
 menubar/DeckKit.app/
 

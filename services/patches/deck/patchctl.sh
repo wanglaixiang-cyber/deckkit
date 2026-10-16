@@ -203,7 +203,7 @@ resolve_game() {
 patch_dirs() {
   [ -d "$STORE" ] || return 0
   # 只排除以点开头的（旧规则是 [a-z0-9]*，那会把中日文短名的补丁整个藏起来 —— 实测踩过：
-  # slugify 允许中日文之后，"MyGame2-汉化补丁" 在 list/status 里根本看不见）
+  # slugify 允许中日文之后，"阳光下的真实-汉化补丁" 在 list/status 里根本看不见）
   find "$STORE" -mindepth 2 -maxdepth 2 -type d -name '[!.]*' 2>/dev/null | sort
 }
 
@@ -808,7 +808,7 @@ cmd_run_installer() {
 # **不能靠 mtime 找"刚写的文件"**（这条踩过，实测）：很多安装器/自解压器会把
 # 文件时间戳设成**打包时的时间**（补丁作者那边），于是新写入的文件 mtime 反而
 # 比"安装开始时刻"更早 —— `find -newermt @since` 一个都匹配不到。
-# 实测 Some Game 3 官方汉化补丁：装进去 1469 个文件，
+# 实测 Some Game 14 官方汉化补丁：装进去 1469 个文件，
 # 时间戳全是补丁打包时的 01:12~01:14，而安装动作发生在 03:03
 # → find 只命中 2 个（游戏自己写的 debug.log / 存档），manifest 记成 0 条。
 #
